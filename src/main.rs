@@ -24,7 +24,6 @@ const ROWS: usize = 30;
 const SCROLLBACK: usize = 10000;
 const FG: u32 = 0xd4d4d4;
 const BG: u32 = 0x0e0e12;
-const PAD: usize = 10;
 
 pub fn sel(s: &str) -> SEL {
     let c = CString::new(s).unwrap();
@@ -68,6 +67,12 @@ struct App {
     ready: bool,
     view_w: f64,
     view_h: f64,
+}
+
+impl App {
+    fn pad(&self) -> usize {
+        (self.atlas.cw / 3).max(2)
+    }
 }
 
 static mut G: *mut App = null_mut();
@@ -175,7 +180,7 @@ fn present() {
         }
     }
     let was_all = a.t.all_dirty;
-    let pad = PAD * a.scale;
+    let pad = a.pad();
     let surf = a.surf[cs];
     let drew = unsafe {
         IOSurfaceLock(surf, 0, null_mut());
@@ -220,7 +225,7 @@ fn relayout() {
         a.fbw = fbw;
         a.fbh = fbh;
     }
-    let pad = PAD * a.scale;
+    let pad = a.pad();
     a.t.resize(
         fbw.saturating_sub(2 * pad).max(a.atlas.cw) / a.atlas.cw,
         fbh.saturating_sub(2 * pad).max(a.atlas.ch) / a.atlas.ch,
@@ -441,8 +446,7 @@ extern "C" fn v_mouse(_s: Id, cmd: SEL, ev: Id) {
     let clicks: i64 = if kind == input::DOWN { unsafe { msg![i64: ev, "clickCount"] } } else { 0 };
     let report = {
         let a = app();
-        let pad = PAD * a.scale;
-        let (gx, gy) = input::cell(p.x, p.y, a.scale, pad, a.atlas.cw, a.atlas.ch, a.t.cols, a.t.rows);
+        let (gx, gy) = input::cell(p.x, p.y, a.scale, a.pad(), a.atlas.cw, a.atlas.ch, a.t.cols, a.t.rows);
         if a.t.modes.mouse != 0 && mods & input::SHIFT == 0 && a.t.view == 0 {
             input::mouse_report(btn, kind, mods, gx, gy, &a.t.modes)
         } else {
@@ -482,8 +486,7 @@ extern "C" fn v_scroll(_s: Id, _c: SEL, ev: Id) {
         if lines == 0 { return }
         let n = lines.unsigned_abs().min(30) as usize;
         if a.t.modes.mouse != 0 && mods & input::SHIFT == 0 && a.t.view == 0 {
-            let pad = PAD * a.scale;
-            let (gx, gy) = input::cell(p.x, p.y, a.scale, pad, a.atlas.cw, a.atlas.ch, a.t.cols, a.t.rows);
+            let (gx, gy) = input::cell(p.x, p.y, a.scale, a.pad(), a.atlas.cw, a.atlas.ch, a.t.cols, a.t.rows);
             let btn = if lines > 0 { input::WHEEL_UP } else { input::WHEEL_DOWN };
             input::mouse_report(btn, input::DOWN, mods, gx, gy, &a.t.modes).map(|b| b.repeat(n))
         } else if a.t.alt != 0 {
@@ -620,8 +623,9 @@ fn main() {
         let scale = if sf > 1.5 { 2usize } else { 1 };
         let atlas = Atlas::new(FONT_PT * scale as f64);
 
-        let w = (COLS * atlas.cw + 2 * PAD * scale) as f64 / scale as f64;
-        let h = (ROWS * atlas.ch + 2 * PAD * scale) as f64 / scale as f64;
+        let pad = (atlas.cw / 3).max(2);
+        let w = (COLS * atlas.cw + 2 * pad) as f64 / scale as f64;
+        let h = (ROWS * atlas.ch + 2 * pad) as f64 / scale as f64;
         let rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { w, h } };
 
         let vc = make_view_class();
