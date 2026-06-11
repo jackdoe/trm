@@ -1,0 +1,12 @@
+[package]
+name = "trm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2
+strip = true
+panic = "abort"
+overflow-checks = true
