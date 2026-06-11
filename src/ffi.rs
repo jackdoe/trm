@@ -94,6 +94,7 @@ extern "C" {
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
     pub static NSPasteboardTypeString: Id;
+    pub static NSPasteboardTypeFileURL: Id;
 }
 
 #[link(name = "QuartzCore", kind = "framework")]

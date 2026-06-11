@@ -14,6 +14,25 @@ pub struct Atlas {
 
 const HOLLOW: u32 = 0;
 const OUTLINE: u32 = 1;
+const PHOSPHOR: (f32, f32, f32) = (255.0, 176.0, 0.0);
+
+fn luma(rgb: u32) -> f32 {
+    ((rgb >> 16 & 255) * 54 + (rgb >> 8 & 255) * 183 + (rgb & 255) * 19) as f32 / 65280.0
+}
+
+fn phosphor(l: f32) -> u32 {
+    ((PHOSPHOR.0 * l) as u32) << 16 | ((PHOSPHOR.1 * l) as u32) << 8 | (PHOSPHOR.2 * l) as u32
+}
+
+fn amber_fg(rgb: u32) -> u32 {
+    let l = luma(rgb);
+    if l < 0.02 { return phosphor(l) }
+    phosphor(0.25 + 0.75 * l.powf(0.7))
+}
+
+fn amber_bg(rgb: u32) -> u32 {
+    phosphor(luma(rgb).powf(1.3))
+}
 
 fn is_proc(cp: u32) -> bool {
     matches!(cp, 0x2500..=0x259f | 0x2800..=0x28ff | 0x23ba..=0x23bd | 0x23bf | 0x23fa)
@@ -331,10 +350,11 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
     drawn.clear();
     drawn.resize(t.rows, false);
     let mut drew = t.all_dirty;
+    let def_bg = amber_bg(t.def_bg);
     if t.all_dirty {
-        fb.fill_at(0, 0, fb.w, fb.oy, t.def_bg);
+        fb.fill_at(0, 0, fb.w, fb.oy, def_bg);
         let bot = fb.oy + t.rows * ch;
-        fb.fill_at(0, bot, fb.w, fb.h.saturating_sub(bot), t.def_bg);
+        fb.fill_at(0, bot, fb.w, fb.h.saturating_sub(bot), def_bg);
     }
     for d in 0..t.rows {
         let live = d as i64 - t.view as i64;
@@ -346,7 +366,7 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
         let line = t.line_at(id);
         let cursor_row = t.view == 0 && d == t.y && t.modes.tcem;
         let py = d * ch;
-        fb.fill_at(0, fb.oy + py, fb.ox, ch, t.def_bg);
+        fb.fill_at(0, fb.oy + py, fb.ox, ch, def_bg);
         let mut x = 0;
         while x < t.cols {
             let c = line
@@ -360,9 +380,13 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             let (mut fg, mut bg) = (c.fg, c.bg);
             if c.attr & vt::REV != 0 { std::mem::swap(&mut fg, &mut bg) }
             if c.attr & vt::FAINT != 0 { fg = fg >> 1 & 0x7f7f7f }
-            if sel_contains(sel, id, x) { std::mem::swap(&mut fg, &mut bg) }
+            if sel_contains(sel, id, x) {
+                fg = 0x000000;
+                bg = 0xffffff;
+            }
             let cursor = cursor_row && x == t.x;
             if cursor && focused { std::mem::swap(&mut fg, &mut bg) }
+            let (fg, bg) = (amber_fg(fg), amber_bg(bg));
             fb.fill(px, py, cell_w, ch, bg);
             if c.cp != 0 && c.cp != b' ' as u32 {
                 if is_proc(c.cp) {
@@ -388,15 +412,16 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             }
             if cursor && !focused {
                 let g = atlas.proc_cached(OUTLINE, wide, lt);
-                fb.blend_cov(px, py, g, cell_w, ch, t.def_fg, 0);
+                let c = amber_fg(t.def_fg);
+                fb.blend_cov(px, py, g, cell_w, ch, c, 0);
             }
             x += if wide { 2 } else { 1 };
         }
         let edge = t.cols * cw;
-        if edge < fb.w { fb.fill(edge, py, fb.w - edge, ch, t.def_bg) }
+        if edge < fb.w { fb.fill(edge, py, fb.w - edge, ch, def_bg) }
     }
     if t.all_dirty && t.rows * ch < fb.h {
-        fb.fill(0, t.rows * ch, fb.w, fb.h - t.rows * ch, t.def_bg);
+        fb.fill(0, t.rows * ch, fb.w, fb.h - t.rows * ch, def_bg);
     }
     t.dirty.fill(false);
     t.all_dirty = false;

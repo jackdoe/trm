@@ -22,8 +22,8 @@ const FONT_PT: f64 = 13.0;
 const COLS: usize = 100;
 const ROWS: usize = 30;
 const SCROLLBACK: usize = 10000;
-const FG: u32 = 0xd4d4d4;
-const BG: u32 = 0x0e0e12;
+const FG: u32 = 0xffffff;
+const BG: u32 = 0x000000;
 
 pub fn sel(s: &str) -> SEL {
     let c = CString::new(s).unwrap();
@@ -393,6 +393,34 @@ extern "C" fn v_char_index(_s: Id, _c: SEL, _p: CGPoint) -> u64 { 0 }
 extern "C" fn v_unmark(_s: Id, _c: SEL) {}
 extern "C" fn v_set_marked(_s: Id, _c: SEL, _t: Id, _a: NSRange, _b: NSRange) {}
 
+extern "C" fn v_drag_entered(_s: Id, _c: SEL, _info: Id) -> u64 { 1 }
+extern "C" fn v_drag_prepare(_s: Id, _c: SEL, _info: Id) -> bool { true }
+
+extern "C" fn v_drag_perform(_s: Id, _c: SEL, info: Id) -> bool {
+    let paths = unsafe {
+        let pb: Id = msg![Id: info, "draggingPasteboard"];
+        if pb.is_null() { return false }
+        let classes: Id = msg![Id: cls("NSArray"), "arrayWithObject:", Id: cls("NSURL")];
+        let urls: Id = msg![Id: pb, "readObjectsForClasses:options:", Id: classes, Id: null_mut()];
+        if urls.is_null() { return false }
+        let n: u64 = msg![u64: urls, "count"];
+        let mut paths = Vec::new();
+        for i in 0..n {
+            let url: Id = msg![Id: urls, "objectAtIndex:", u64: i];
+            let path: Id = msg![Id: url, "path"];
+            if path.is_null() { continue }
+            let u: *const c_char = msg![*const c_char: path, "UTF8String"];
+            if u.is_null() { continue }
+            paths.push(CStr::from_ptr(u).to_string_lossy().into_owned());
+        }
+        paths
+    };
+    if paths.is_empty() { return false }
+    let payload = input::drop_paths(paths, app().t.modes.paste);
+    send(&payload);
+    true
+}
+
 extern "C" fn v_key_down(this: Id, _c: SEL, ev: Id) {
     let (ch, mods) = unsafe { (ev_char(ev), msg![u64: ev, "modifierFlags"]) };
     let act = {
@@ -603,6 +631,9 @@ fn make_view_class() -> Id {
             add(s, v_mouse as *const c_void, "v@:@");
         }
         add("scrollWheel:", v_scroll as *const c_void, "v@:@");
+        add("draggingEntered:", v_drag_entered as *const c_void, "Q@:@");
+        add("prepareForDragOperation:", v_drag_prepare as *const c_void, "c@:@");
+        add("performDragOperation:", v_drag_perform as *const c_void, "c@:@");
         add("setFrameSize:", v_set_frame_size as *const c_void, "v@:{CGSize=dd}");
         add("viewDidChangeBackingProperties", v_backing_changed as *const c_void, "v@:");
         add("windowWillClose:", w_will_close as *const c_void, "v@:@");
@@ -643,6 +674,8 @@ fn main() {
         let _: () = msg![(): win, "setContentView:", Id: view];
         let _: () = msg![(): win, "setDelegate:", Id: view];
         let _: () = msg![(): win, "makeFirstResponder:", Id: view];
+        let drag_types: Id = msg![Id: cls("NSArray"), "arrayWithObject:", Id: NSPasteboardTypeFileURL];
+        let _: () = msg![(): view, "registerForDraggedTypes:", Id: drag_types];
         let _: () = msg![(): view, "setWantsLayer:", bool: true];
         let layer: Id = msg![Id: view, "layer"];
         let _: () = msg![(): layer, "setContentsGravity:", Id: kCAGravityTopLeft];

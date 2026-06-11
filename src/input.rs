@@ -113,6 +113,36 @@ pub fn clean_paste(raw: &[u8], bracketed: bool) -> Vec<u8> {
     out
 }
 
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./+:@%=,".contains(&b)) {
+        return s.into();
+    }
+    let mut q = String::with_capacity(s.len() + 2);
+    q.push('\'');
+    for c in s.chars() {
+        if c == '\'' { q.push_str("'\\''") } else { q.push(c) }
+    }
+    q.push('\'');
+    q
+}
+
+pub fn drop_paths<I: IntoIterator<Item = String>>(paths: I, bracketed: bool) -> Vec<u8> {
+    let joined: String = paths
+        .into_iter()
+        .map(|p| {
+            let clean: String = p.chars().filter(|c| !c.is_control()).collect();
+            shell_quote(&clean)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = Vec::new();
+    if bracketed { out.extend(b"\x1b[200~") }
+    out.extend(joined.as_bytes());
+    out.push(b' ');
+    if bracketed { out.extend(b"\x1b[201~") }
+    out
+}
+
 pub fn mouse_report(btn: i64, kind: u8, mods: u64, gx: usize, gy: usize, m: &Modes) -> Option<Vec<u8>> {
     if !m.sgr_mouse { return None }
     let mut b = btn;
@@ -215,6 +245,26 @@ mod tests {
         assert_eq!(clean_paste(b"a\r\nb\nc\td", false), b"a\rb\rc\td");
         assert_eq!(clean_paste(b"x", true), b"\x1b[200~x\x1b[201~");
         assert_eq!(clean_paste(b"\xc2\xa9", false), b"\xc2\xa9");
+    }
+
+    #[test]
+    fn quoting() {
+        assert_eq!(shell_quote("/usr/bin/cc"), "/usr/bin/cc");
+        assert_eq!(shell_quote("/tmp/my file.txt"), "'/tmp/my file.txt'");
+        assert_eq!(shell_quote("/a/it's"), "'/a/it'\\''s'");
+    }
+
+    #[test]
+    fn drop_security() {
+        assert_eq!(drop_paths(["/bin/ls".into()], false), b"/bin/ls ");
+        // shell metacharacters are inert (single-quoted)
+        assert_eq!(drop_paths(["/t/$(reboot);x".into()], false), b"'/t/$(reboot);x' ");
+        // a newline in a filename must NOT survive as CR/LF (no line submission)
+        let evil = drop_paths(["a\nrm -rf ~".into()], false);
+        assert!(!evil.contains(&b'\n') && !evil.contains(&b'\r'));
+        assert_eq!(evil, "'arm -rf ~' ".as_bytes());
+        // bracketed wrapping when paste mode is on
+        assert_eq!(drop_paths(["/a".into()], true), b"\x1b[200~/a \x1b[201~");
     }
 
     #[test]
