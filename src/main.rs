@@ -404,6 +404,11 @@ extern "C" fn v_key_down(this: Id, _c: SEL, ev: Id) {
         Act::Copy => copy_selection(),
         Act::Paste => paste(),
         Act::Font(d) => set_font(d),
+        Act::NewWindow => {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+        }
         Act::Quit => std::process::exit(0),
         Act::Eat => {}
         Act::Pass => unsafe {

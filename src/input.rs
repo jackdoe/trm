@@ -16,6 +16,7 @@ pub enum Act {
     Copy,
     Paste,
     Font(f64),
+    NewWindow,
     Quit,
     Eat,
     Pass,
@@ -47,6 +48,7 @@ pub fn key(ch: u16, mods: u64, m: &Modes) -> Act {
     if mods & CMD != 0 {
         return match ch as u8 {
             b'q' => Act::Quit,
+            b'n' => Act::NewWindow,
             b'c' => Act::Copy,
             b'v' => Act::Paste,
             b'=' | b'+' => Act::Font(1.0),

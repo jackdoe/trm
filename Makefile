@@ -42,4 +42,8 @@ clean:
 	cargo clean
 	rm -rf $(APP)
 
-.PHONY: all run test clean
+.PHONY: all run test install clean
+
+install: $(APP)
+	rm -rf /Applications/Trm.app
+	cp -R $(APP) /Applications/Trm.app
