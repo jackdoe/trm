@@ -67,6 +67,7 @@ struct App {
     ready: bool,
     view_w: f64,
     view_h: f64,
+    title: String,
 }
 
 impl App {
@@ -252,17 +253,35 @@ fn set_font(delta: f64) {
     relayout();
 }
 
+fn pasteboard_set(text: &[u8]) {
+    unsafe {
+        let pb: Id = msg![Id: cls("NSPasteboard"), "generalPasteboard"];
+        let _: i64 = msg![i64: pb, "clearContents"];
+        let s = nsstr(&String::from_utf8_lossy(text));
+        let _: bool = msg![bool: pb, "setString:forType:", Id: s, Id: NSPasteboardTypeString];
+    }
+}
+
 fn copy_selection() {
     let text = {
         let a = app();
         a.sel.text(&a.t)
     };
     let Some(text) = text else { return };
+    pasteboard_set(&text);
+}
+
+extern "C" fn flash_cb(_t: *mut c_void, _info: *mut c_void) {
+    let a = app();
+    unsafe { msg![(): a.win, "setTitle:", Id: nsstr(&a.title)] }
+}
+
+fn clip_flash(n: usize) {
     unsafe {
-        let pb: Id = msg![Id: cls("NSPasteboard"), "generalPasteboard"];
-        let _: i64 = msg![i64: pb, "clearContents"];
-        let s = nsstr(&String::from_utf8_lossy(&text));
-        let _: bool = msg![bool: pb, "setString:forType:", Id: s, Id: NSPasteboardTypeString];
+        msg![(): app().win, "setTitle:", Id: nsstr(&format!("\u{29c9} clipboard \u{2190} {} bytes", n))];
+        let t = CFRunLoopTimerCreate(null(), CFAbsoluteTimeGetCurrent() + 1.5, 0.0, 0, 0, flash_cb, null_mut());
+        CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+        CFRelease(t);
     }
 }
 
@@ -280,18 +299,23 @@ fn paste() {
 }
 
 fn app_feed(buf: &[u8]) {
-    let (out, title) = {
+    let (out, title, clip) = {
         let a = app();
         a.t.feed(buf);
         if a.sel.on.is_some() && !a.sel.dragging {
             a.sel.on = None;
             a.t.all_dirty = true;
         }
-        (std::mem::take(&mut a.t.out), a.t.title.take())
+        (std::mem::take(&mut a.t.out), a.t.title.take(), a.t.clip.take())
     };
     if !out.is_empty() { pty_write(&out) }
     if let Some(s) = title {
+        app().title = s.clone();
         unsafe { msg![(): app().win, "setTitle:", Id: nsstr(&s)] }
+    }
+    if let Some(c) = clip {
+        pasteboard_set(&c);
+        clip_flash(c.len());
     }
     schedule_frame();
 }
@@ -697,6 +721,7 @@ fn main() {
             last_cursor: (0, 0),
             scroll_acc: 0.0, focused: true, ready: false,
             view_w: w, view_h: h,
+            title: "trm".into(),
         }));
 
         let fdref = CFFileDescriptorCreate(null(), pty, false, pty_cb, null_mut());

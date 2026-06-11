@@ -6,7 +6,7 @@ constraints: no third-party code, minimal attack surface, software rendering,
 and the smallest codebase that can comfortably run modern TUI applications
 like Claude Code, vim, htop, and tmux.
 
-Roughly 2,900 lines of Rust. Zero crates. The only linked libraries are
+Roughly 3,100 lines of Rust. Zero crates. The only linked libraries are
 macOS system frameworks (AppKit, QuartzCore, CoreFoundation, IOSurface) —
 no CoreText, no CoreGraphics: font parsing and rasterization are done by
 trm's own TrueType engine over an embedded font (3270 Nerd Font). The
@@ -71,7 +71,11 @@ as double-width placeholder boxes by design: one font, no fallback stack.
   the code that parses it cannot contain `unsafe` (enforced at compile time).
 - Paste is sanitized: ESC, C0, and UTF-8-encoded C1 controls are stripped,
   so clipboard contents cannot smuggle escape sequences.
-- No clipboard read access for programs (no OSC 52), titles are
+- Programs can *set* the clipboard via OSC 52, but never silently: every
+  write flashes the window title (`⧉ clipboard ← N bytes`) for 1.5 s.
+  Payloads are strictly-validated base64; oversized OSC (>1.5 MB) is
+  dropped whole rather than truncated. The OSC 52 *read* query is not
+  implemented — programs can never read the clipboard. Titles are
   control-stripped and capped.
 - `DYLD_*` variables are stripped from the child environment.
 - No network code, no runtime config parsing, no plugins, no logging.

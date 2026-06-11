@@ -109,6 +109,35 @@ pub struct Term {
     uhave: u8,
     pub out: Vec<u8>,
     pub title: Option<String>,
+    pub clip: Option<Vec<u8>>,
+}
+
+const OSC_MAX: usize = 1_500_000;
+
+fn b64_decode(s: &[u8]) -> Option<Vec<u8>> {
+    fn v(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let s = s.strip_suffix(b"==").or_else(|| s.strip_suffix(b"=")).unwrap_or(s);
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &b in s {
+        acc = acc << 6 | v(b)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 const ZERO_W: &[(u32, u32)] = &[
@@ -174,6 +203,7 @@ impl Term {
             ucp: 0, uneed: 0, uhave: 0,
             out: vec![],
             title: None,
+            clip: None,
         };
         t.reset_tabs();
         t
@@ -689,15 +719,26 @@ impl Term {
 
     fn osc_dispatch(&mut self) {
         let osc = std::mem::take(&mut self.osc);
+        if osc.len() >= OSC_MAX { return }
         let mut it = osc.splitn(2, |&b| b == b';');
         let num = it.next().unwrap_or(&[]);
         if !num.iter().all(|b| b.is_ascii_digit()) { return }
         let cmd: u32 = std::str::from_utf8(num).ok().and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
-        if let (0 | 2, Some(payload)) = (cmd, it.next()) {
-            let mut s = String::from_utf8_lossy(payload).into_owned();
-            s.retain(|c| !c.is_control());
-            s.truncate(255);
-            self.title = Some(s);
+        match (cmd, it.next()) {
+            (0 | 2, Some(payload)) => {
+                let mut s = String::from_utf8_lossy(payload).into_owned();
+                s.retain(|c| !c.is_control());
+                s.truncate(255);
+                self.title = Some(s);
+            }
+            (52, Some(payload)) => {
+                let mut p = payload.splitn(2, |&b| b == b';');
+                let (_, data) = (p.next(), p.next().unwrap_or(&[]));
+                if !data.is_empty() && data != b"?" {
+                    if let Some(text) = b64_decode(data) { self.clip = Some(text) }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -808,7 +849,7 @@ impl Term {
                     7 => { self.st = St::Ground; self.osc_dispatch() }
                     0x1b => self.esc_str = true,
                     0x18 | 0x1a => self.st = St::Ground,
-                    _ => if self.osc.len() < 4096 { self.osc.push(b) },
+                    _ => if self.osc.len() < OSC_MAX { self.osc.push(b) },
                 }
             }
             St::Str => {
@@ -966,6 +1007,25 @@ mod tests {
             let t = run(80, 24, input);
             assert_eq!(String::from_utf8_lossy(&t.out), want, "input {:?}", input);
         }
+    }
+
+    #[test]
+    fn osc52_clipboard() {
+        let t = run(10, 2, "\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(t.clip.as_deref(), Some(&b"hello"[..]));
+
+        let t = run(10, 2, "\x1b]52;c;?\x07");
+        assert_eq!(t.clip, None);
+        assert_eq!(t.out, b"");
+
+        let t = run(10, 2, "\x1b]52;;aGk=\x07");
+        assert_eq!(t.clip.as_deref(), Some(&b"hi"[..]));
+
+        let t = run(10, 2, "\x1b]52;c;!!notbase64!!\x07");
+        assert_eq!(t.clip, None);
+
+        let t = run(10, 2, "\x1b]52;c;\x07");
+        assert_eq!(t.clip, None);
     }
 
     #[test]
