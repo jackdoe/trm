@@ -65,6 +65,8 @@ struct App {
     frame_scheduled: bool,
     sync_since: f64,
     sel: input::Sel,
+    drag_pt: CGPoint,
+    autoscroll: bool,
     last_cursor: (usize, usize),
     scroll_acc: f64,
     focused: bool,
@@ -1028,6 +1030,39 @@ extern "C" fn v_do_command(_s: Id, _c: SEL, cmd: SEL) {
     }
 }
 
+extern "C" fn autoscroll_cb(_t: *mut c_void, _info: *mut c_void) {
+    app().autoscroll = false;
+    drag_sel();
+}
+
+fn drag_sel() {
+    let a = app();
+    if !a.sel.dragging { return }
+    let step = a.atlas.ch as f64 / a.scale as f64;
+    let lines = if a.t.alt != 0 {
+        0
+    } else if a.drag_pt.y < 0.0 {
+        ((-a.drag_pt.y / step) as i64 + 1).min(30)
+    } else if a.drag_pt.y > a.view_h {
+        (((a.view_h - a.drag_pt.y) / step) as i64 - 1).max(-30)
+    } else {
+        0
+    };
+    a.t.view = (a.t.view as i64 + lines).clamp(0, a.t.sb.len() as i64) as usize;
+    let (gx, gy) = input::cell(a.drag_pt.x, a.drag_pt.y, a.scale, a.pad(), a.atlas.cw, a.atlas.ch, a.t.cols, a.t.rows);
+    a.sel.drag(&a.t, a.t.line_id(gy), gx);
+    a.t.all_dirty = true;
+    if lines != 0 && !a.autoscroll {
+        a.autoscroll = true;
+        unsafe {
+            let t = CFRunLoopTimerCreate(null(), CFAbsoluteTimeGetCurrent() + 0.05, 0.0, 0, 0, autoscroll_cb, null_mut());
+            CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+            CFRelease(t);
+        }
+    }
+    schedule_frame();
+}
+
 extern "C" fn v_mouse(_s: Id, cmd: SEL, ev: Id) {
     let name = unsafe { CStr::from_ptr(sel_getName(cmd)) }.to_bytes();
     let btn: i64 = match name[0] {
@@ -1045,10 +1080,11 @@ extern "C" fn v_mouse(_s: Id, cmd: SEL, ev: Id) {
             input::mouse_report(btn, kind, mods, gx, gy, &a.t.modes)
         } else {
             if btn == 0 {
+                a.drag_pt = p;
                 let id = a.t.line_id(gy);
                 match kind {
                     input::DOWN => a.sel.begin(&a.t, id, gx, clicks),
-                    input::DRAG => a.sel.drag(&a.t, id, gx),
+                    input::DRAG => {}
                     _ => a.sel.finish(id, gx),
                 }
                 a.t.all_dirty = true;
@@ -1056,6 +1092,7 @@ extern "C" fn v_mouse(_s: Id, cmd: SEL, ev: Id) {
             None
         }
     };
+    if btn == 0 && kind == input::DRAG && report.is_none() { drag_sel() }
     match report {
         Some(b) => pty_write(&b),
         None => schedule_frame(),
@@ -1271,6 +1308,8 @@ fn main() {
             outq: VecDeque::new(),
             frame_scheduled: false, sync_since: 0.0,
             sel: input::Sel::default(),
+            drag_pt: CGPoint { x: 0.0, y: 0.0 },
+            autoscroll: false,
             last_cursor: (0, 0),
             scroll_acc: 0.0, focused: true, ready: false,
             view_w: w, view_h: h,
