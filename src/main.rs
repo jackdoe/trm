@@ -408,18 +408,26 @@ fn argv0(pid: c_int) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[start..i]).into_owned())
 }
 
-fn pname(pid: c_int) -> Option<String> {
-    let mut buf = [0u8; 64];
-    let n = unsafe { proc_name(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
-    if n <= 0 { return None }
-    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+// kinfo_proc.kp_proc.p_comm sits at offset 243 of the 648-byte struct;
+// readable for any pid (ps's mechanism), unlike procargs2, which the kernel
+// refuses for setuid processes like top
+fn kcomm(pid: c_int) -> Option<String> {
+    let mut mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid];
+    let mut buf = [0u8; 648];
+    let mut len = buf.len();
+    let r = unsafe { sysctl(mib.as_mut_ptr(), 4, buf.as_mut_ptr() as *mut c_void, &mut len, null_mut(), 0) };
+    if r != 0 || len < 260 { return None }
+    let comm = &buf[243..260];
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    if end == 0 { return None }
+    Some(String::from_utf8_lossy(&comm[..end]).into_owned())
 }
 
 fn fg_cmd() -> Option<String> {
     let a = app();
     let pid = unsafe { tcgetpgrp(a.pty) };
     if pid <= 0 || pid == a.child { return None }
-    let name = argv0(pid).or_else(|| pname(pid))?;
+    let name = argv0(pid).or_else(|| kcomm(pid))?;
     let base = name.rsplit('/').next().unwrap_or(&name).trim_start_matches('-');
     if base.is_empty() { return None }
     Some(base.into())
@@ -846,6 +854,21 @@ mod cwd_tests {
     fn argv0_of_self() {
         let name = argv0(std::process::id() as c_int).unwrap();
         assert!(name.rsplit('/').next().unwrap().starts_with("trm"), "{}", name);
+    }
+
+    #[test]
+    fn kcomm_of_setuid_top() {
+        assert!(kcomm(std::process::id() as c_int).unwrap().starts_with("trm"));
+        let out = std::process::Command::new("/usr/bin/top")
+            .args(["-l", "1", "-n", "0"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = out.id() as c_int;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let name = kcomm(pid);
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+        assert_eq!(name.as_deref(), Some("top"));
     }
 
     #[test]
