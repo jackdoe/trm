@@ -57,6 +57,7 @@ struct App {
     scale: usize,
     font_pt: f64,
     gamma: f64,
+    phosphor: usize,
     pty: c_int,
     child: c_int,
     fdref: *mut c_void,
@@ -192,7 +193,7 @@ fn present() {
         let stride = IOSurfaceGetBytesPerRow(surf) / 4;
         let px = std::slice::from_raw_parts_mut(IOSurfaceGetBaseAddress(surf) as *mut u32, stride * a.fbh);
         let mut fb = Fb { px, w: a.fbw, h: a.fbh, stride, ox: pad, oy: pad };
-        let drew = render::frame(&mut a.t, &mut a.atlas, &mut fb, &a.sel.on, a.focused, a.gamma as f32, &mut a.drawn);
+        let drew = render::frame(&mut a.t, &mut a.atlas, &mut fb, &a.sel.on, a.focused, a.gamma as f32, a.phosphor, &mut a.drawn);
         IOSurfaceUnlock(surf, 0, null_mut());
         drew
     };
@@ -258,7 +259,7 @@ fn save_settings() {
         let _ = std::fs::create_dir_all(dir);
     }
     let a = app();
-    let _ = std::fs::write(p, format!("font_pt={}\ngamma={}\n", a.font_pt, a.gamma));
+    let _ = std::fs::write(p, format!("font_pt={}\ngamma={}\nphosphor={}\n", a.font_pt, a.gamma, a.phosphor));
 }
 
 fn set_font(delta: f64) {
@@ -283,6 +284,16 @@ fn set_gamma(delta: f64) {
     a.t.all_dirty = true;
     schedule_frame();
     save_settings();
+}
+
+fn cycle_phosphor() {
+    let a = app();
+    a.phosphor = (a.phosphor + 1) % render::PHOSPHORS.len();
+    a.t.all_dirty = true;
+    a.cwd.clear();
+    schedule_frame();
+    save_settings();
+    poll_cb(null_mut(), null_mut());
 }
 
 fn pasteboard_set(text: &[u8]) {
@@ -454,13 +465,12 @@ fn tilde(p: &str) -> String {
     }
 }
 
-unsafe fn icon_attrs(pt: f64, amber: bool) -> Id {
+unsafe fn icon_attrs(pt: f64, dim: bool) -> Id {
     let font: Id = msg![Id: cls("NSFont"), "monospacedSystemFontOfSize:weight:", f64: pt, f64: 0.4];
-    let color: Id = if amber {
-        msg![Id: cls("NSColor"), "colorWithSRGBRed:green:blue:alpha:", f64: 1.0, f64: 176.0 / 255.0, f64: 0.0, f64: 1.0]
-    } else {
-        msg![Id: cls("NSColor"), "whiteColor"]
-    };
+    let (r, g, b) = render::PHOSPHORS[app().phosphor];
+    let l = if dim { 0.6 } else { 1.0 };
+    let color: Id = msg![Id: cls("NSColor"), "colorWithSRGBRed:green:blue:alpha:",
+        f64: r as f64 * l / 255.0, f64: g as f64 * l / 255.0, f64: b as f64 * l / 255.0, f64: 1.0];
     let keys = [NSFontAttributeName, NSForegroundColorAttributeName];
     let vals = [font, color];
     msg![Id: cls("NSDictionary"), "dictionaryWithObjects:forKeys:count:",
@@ -474,9 +484,6 @@ fn icon8(text: &str) -> String {
     s
 }
 
-// Dock and cmd+tab show the live application icon, so drawing the directory
-// name (white) and the running command (amber, smaller) into it is the one
-// switcher surface we can actually update at runtime.
 unsafe fn set_app_icon(dir: &str, cmd: Option<&str>) {
     let img: Id = msg![Id: msg![Id: cls("NSImage"), "alloc"], "initWithSize:", CGSize: CGSize { w: 512.0, h: 512.0 }];
     let _: () = msg![(): img, "lockFocus"];
@@ -489,9 +496,9 @@ unsafe fn set_app_icon(dir: &str, cmd: Option<&str>) {
     let cmd_pt = dir_pt * 0.55;
     let (dir_h, cmd_h) = (probe.h * dir_pt / 100.0, probe.h * cmd_pt / 100.0);
     let top = (512.0 + dir_h + cmd_h) / 2.0;
-    for (text, pt, amber, y) in [(dir, dir_pt, false, top - dir_h), (cmd.unwrap_or(""), cmd_pt, true, top - dir_h - cmd_h)] {
+    for (text, pt, dim, y) in [(dir, dir_pt, false, top - dir_h), (cmd.unwrap_or(""), cmd_pt, true, top - dir_h - cmd_h)] {
         if text.is_empty() { continue }
-        let attrs = icon_attrs(pt, amber);
+        let attrs = icon_attrs(pt, dim);
         let s = nsstr(text);
         let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: attrs];
         let _: () = msg![(): s, "drawAtPoint:withAttributes:", CGPoint: CGPoint { x: (512.0 - sz.w) / 2.0, y }, Id: attrs];
@@ -713,7 +720,7 @@ mod cwd_tests {
                 }
                 let was_all = t.all_dirty;
                 let mut fb = Fb { px: &mut bufs[cur], w, h, stride: w, ox: 4, oy: 4 };
-                let drew = render::frame(&mut t, &mut atlas, &mut fb, &None, true, 0.45, &mut drawn);
+                let drew = render::frame(&mut t, &mut atlas, &mut fb, &None, true, 0.45, 0, &mut drawn);
                 if !drew { continue }
                 stale[cur].fill(false);
                 stale_all[cur] = false;
@@ -731,7 +738,7 @@ mod cwd_tests {
             rt.all_dirty = true;
             let mut rbuf = vec![0u32; w * h];
             let mut fb = Fb { px: &mut rbuf, w, h, stride: w, ox: 4, oy: 4 };
-            render::frame(&mut rt, &mut atlas, &mut fb, &None, true, 0.45, &mut drawn);
+            render::frame(&mut rt, &mut atlas, &mut fb, &None, true, 0.45, 0, &mut drawn);
             let diff = bufs[shown].iter().zip(&rbuf).filter(|(a, b)| a != b).count();
             assert_eq!(diff, 0, "chunk={}: {} pixels differ from full redraw", chunk, diff);
         }
@@ -976,17 +983,18 @@ extern "C" fn v_key_down(this: Id, _c: SEL, ev: Id) {
         Act::Paste => paste(),
         Act::Font(d) => set_font(d),
         Act::Gamma(d) => set_gamma(d),
+        Act::Phosphor => cycle_phosphor(),
         Act::NewWindow => {
             if let Ok(exe) = std::env::current_exe() {
-                let (pt, gamma) = {
+                let (pt, gamma, phos) = {
                     let a = app();
-                    (format!("{}", a.font_pt), format!("{}", a.gamma))
+                    (format!("{}", a.font_pt), format!("{}", a.gamma), format!("{}", a.phosphor))
                 };
                 let mut cmd = std::process::Command::new(&exe);
-                cmd.env("TRM_FONT_PT", &pt).env("TRM_GAMMA", &gamma);
+                cmd.env("TRM_FONT_PT", &pt).env("TRM_GAMMA", &gamma).env("TRM_PHOSPHOR", &phos);
                 if let Some(cwd) = fg_cwd() { cmd.current_dir(cwd); }
                 if cmd.spawn().is_err() {
-                    let _ = std::process::Command::new(exe).env("TRM_FONT_PT", &pt).env("TRM_GAMMA", &gamma).spawn();
+                    let _ = std::process::Command::new(exe).env("TRM_FONT_PT", &pt).env("TRM_GAMMA", &gamma).env("TRM_PHOSPHOR", &phos).spawn();
                 }
             }
         }
@@ -1221,6 +1229,11 @@ fn main() {
             .or_else(|| setting(&conf, "gamma"))
             .filter(|g| g.is_finite())
             .map_or(GAMMA, |g| g.clamp(0.1, 1.0));
+        let phosphor = std::env::var("TRM_PHOSPHOR").ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| setting(&conf, "phosphor"))
+            .filter(|p| p.is_finite())
+            .map_or(0, |p| (p.max(0.0) as usize).min(render::PHOSPHORS.len() - 1));
         let atlas = Atlas::new(font_pt * scale as f64);
 
         let pad = (atlas.cw / 3).max(2);
@@ -1253,7 +1266,7 @@ fn main() {
             stale: [vec![], vec![]], stale_all: [true; 2], drawn: vec![],
             fbw: 0, fbh: 0,
             win, layer, view,
-            scale, font_pt, gamma,
+            scale, font_pt, gamma, phosphor,
             pty, child, fdref: null_mut(),
             outq: VecDeque::new(),
             frame_scheduled: false, sync_since: 0.0,

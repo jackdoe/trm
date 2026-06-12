@@ -15,27 +15,28 @@ pub struct Atlas {
 
 const HOLLOW: u32 = 0;
 const OUTLINE: u32 = 1;
-const PHOSPHOR: (f32, f32, f32) = (255.0, 176.0, 0.0);
+pub const PHOSPHORS: [(f32, f32, f32); 3] = [(255.0, 176.0, 0.0), (51.0, 255.0, 51.0), (255.0, 255.0, 255.0)];
 
 fn luma(rgb: u32) -> f32 {
     ((rgb >> 16 & 255) * 54 + (rgb >> 8 & 255) * 183 + (rgb & 255) * 19) as f32 / 65280.0
 }
 
-fn phosphor(l: f32) -> u32 {
-    ((PHOSPHOR.0 * l) as u32) << 16 | ((PHOSPHOR.1 * l) as u32) << 8 | (PHOSPHOR.2 * l) as u32
+fn tint(p: (f32, f32, f32), l: f32) -> u32 {
+    ((p.0 * l) as u32) << 16 | ((p.1 * l) as u32) << 8 | (p.2 * l) as u32
 }
 
-fn amber_luts(gamma: f32) -> ([u32; 256], [u32; 256]) {
+fn luts(gamma: f32, phosphor: usize) -> ([u32; 256], [u32; 256]) {
+    let p = PHOSPHORS[phosphor % PHOSPHORS.len()];
     (
         std::array::from_fn(|i| {
             let l = i as f32 / 255.0;
-            phosphor(if l < 0.02 { l } else { l.powf(gamma) })
+            tint(p, if l < 0.02 { l } else { l.powf(gamma) })
         }),
-        std::array::from_fn(|i| phosphor((i as f32 / 255.0).powf(1.3))),
+        std::array::from_fn(|i| tint(p, (i as f32 / 255.0).powf(1.3))),
     )
 }
 
-fn amber(lut: &[u32; 256], rgb: u32) -> u32 {
+fn glow(lut: &[u32; 256], rgb: u32) -> u32 {
     lut[(luma(rgb) * 255.0 + 0.5) as usize]
 }
 
@@ -351,14 +352,14 @@ fn sel_contains(sel: &Span, id: u64, x: usize) -> bool {
     (id > al || (id == al && x >= ac)) && (id < bl || (id == bl && x <= bc))
 }
 
-pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: bool, gamma: f32, drawn: &mut Vec<bool>) -> bool {
+pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: bool, gamma: f32, phosphor: usize, drawn: &mut Vec<bool>) -> bool {
     let (cw, ch) = (atlas.cw, atlas.ch);
     let lt = (ch as i64 / 14).max(1);
     drawn.clear();
     drawn.resize(t.rows, false);
     let mut drew = t.all_dirty;
-    let (fg_lut, bg_lut) = amber_luts(gamma);
-    let def_bg = amber(&bg_lut, t.def_bg);
+    let (fg_lut, bg_lut) = luts(gamma, phosphor);
+    let def_bg = glow(&bg_lut, t.def_bg);
     if t.all_dirty {
         fb.fill_at(0, 0, fb.w, fb.oy, def_bg);
         let bot = fb.oy + t.rows * ch;
@@ -394,7 +395,7 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             }
             let cursor = cursor_row && x == t.x;
             if cursor && focused { std::mem::swap(&mut fg, &mut bg) }
-            let (fg, bg) = (amber(&fg_lut, fg), amber(&bg_lut, bg));
+            let (fg, bg) = (glow(&fg_lut, fg), glow(&bg_lut, bg));
             fb.fill(px, py, cell_w, ch, bg);
             if c.cp != 0 && c.cp != b' ' as u32 {
                 if is_proc(c.cp) {
@@ -423,7 +424,7 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             }
             if cursor && !focused {
                 let g = atlas.proc_cached(OUTLINE, wide, lt);
-                let c = amber(&fg_lut, t.def_fg);
+                let c = glow(&fg_lut, t.def_fg);
                 fb.blend_cov(px, py, g, cell_w, ch, c, 0);
             }
             x += if wide { 2 } else { 1 };
@@ -458,7 +459,7 @@ mod tests {
         for _ in 0..n {
             t.all_dirty = true;
             let mut fb = Fb { px: &mut px, w, h, stride: w, ox: 10, oy: 10 };
-            frame(&mut t, &mut atlas, &mut fb, &None, true, 0.45, &mut drawn);
+            frame(&mut t, &mut atlas, &mut fb, &None, true, 0.45, 0, &mut drawn);
         }
         println!("full frame: {:?}", start.elapsed() / n);
     }

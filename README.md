@@ -101,6 +101,8 @@ Benchmarks print with
 
 - Cmd+C / Cmd+V — copy selection / paste (bracketed-paste aware)
 - Cmd+= / Cmd− — font size
+- Cmd+[ / Cmd+] — brightness (gamma)
+- Cmd+P — phosphor: amber / green / white
 - Cmd+Q — quit
 - Scroll wheel — scrollback (10,000 lines); any keypress snaps to bottom
 - Click/drag selects; double-click word, triple-click line; Shift overrides
