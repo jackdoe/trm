@@ -77,6 +77,8 @@ pub const FD_WRITE_CB: u64 = 2;
 
 pub const PROC_PIDVNODEPATHINFO: c_int = 9;
 pub const VERASE: usize = 3;
+pub const CTL_KERN: c_int = 1;
+pub const KERN_PROCARGS2: c_int = 49;
 
 #[repr(C)]
 pub struct Termios {
@@ -191,6 +193,8 @@ extern "C" {
     #[cfg(test)]
     pub fn tcsetattr(fd: c_int, action: c_int, t: *const Termios) -> c_int;
     pub fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *mut c_void, buffersize: c_int) -> c_int;
+    pub fn proc_name(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    pub fn sysctl(name: *mut c_int, namelen: u32, oldp: *mut c_void, oldlenp: *mut usize, newp: *mut c_void, newlen: usize) -> c_int;
     pub fn __error() -> *mut c_int;
 }
 

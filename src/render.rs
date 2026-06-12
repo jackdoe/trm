@@ -24,10 +24,10 @@ fn phosphor(l: f32) -> u32 {
     ((PHOSPHOR.0 * l) as u32) << 16 | ((PHOSPHOR.1 * l) as u32) << 8 | (PHOSPHOR.2 * l) as u32
 }
 
-fn amber_fg(rgb: u32) -> u32 {
+fn amber_fg(rgb: u32, gamma: f32) -> u32 {
     let l = luma(rgb);
     if l < 0.02 { return phosphor(l) }
-    phosphor(0.25 + 0.75 * l.powf(0.7))
+    phosphor(l.powf(gamma))
 }
 
 fn amber_bg(rgb: u32) -> u32 {
@@ -344,7 +344,7 @@ fn sel_contains(sel: &Span, id: u64, x: usize) -> bool {
     (id > al || (id == al && x >= ac)) && (id < bl || (id == bl && x <= bc))
 }
 
-pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: bool, drawn: &mut Vec<bool>) -> bool {
+pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: bool, gamma: f32, drawn: &mut Vec<bool>) -> bool {
     let (cw, ch) = (atlas.cw, atlas.ch);
     let lt = (ch as i64 / 14).max(1);
     drawn.clear();
@@ -386,7 +386,7 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             }
             let cursor = cursor_row && x == t.x;
             if cursor && focused { std::mem::swap(&mut fg, &mut bg) }
-            let (fg, bg) = (amber_fg(fg), amber_bg(bg));
+            let (fg, bg) = (amber_fg(fg, gamma), amber_bg(bg));
             fb.fill(px, py, cell_w, ch, bg);
             if c.cp != 0 && c.cp != b' ' as u32 {
                 if is_proc(c.cp) {
@@ -412,7 +412,7 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             }
             if cursor && !focused {
                 let g = atlas.proc_cached(OUTLINE, wide, lt);
-                let c = amber_fg(t.def_fg);
+                let c = amber_fg(t.def_fg, gamma);
                 fb.blend_cov(px, py, g, cell_w, ch, c, 0);
             }
             x += if wide { 2 } else { 1 };
@@ -447,7 +447,7 @@ mod tests {
         for _ in 0..n {
             t.all_dirty = true;
             let mut fb = Fb { px: &mut px, w, h, stride: w, ox: 10, oy: 10 };
-            frame(&mut t, &mut atlas, &mut fb, &None, true, &mut drawn);
+            frame(&mut t, &mut atlas, &mut fb, &None, true, 0.45, &mut drawn);
         }
         println!("full frame: {:?}", start.elapsed() / n);
     }

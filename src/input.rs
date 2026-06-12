@@ -16,6 +16,7 @@ pub enum Act {
     Copy,
     Paste,
     Font(f64),
+    Gamma(f64),
     NewWindow,
     Quit,
     Eat,
@@ -53,6 +54,8 @@ pub fn key(ch: u16, mods: u64, m: &Modes, erase: u8) -> Act {
             b'v' => Act::Paste,
             b'=' | b'+' => Act::Font(1.0),
             b'-' => Act::Font(-1.0),
+            b']' => Act::Gamma(-0.05),
+            b'[' => Act::Gamma(0.05),
             _ => Act::Eat,
         };
     }

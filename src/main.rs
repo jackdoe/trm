@@ -19,6 +19,7 @@ use std::ptr::{null, null_mut};
 use vt::Term;
 
 const FONT_PT: f64 = 13.0;
+const GAMMA: f64 = 0.45;
 const COLS: usize = 100;
 const ROWS: usize = 30;
 const SCROLLBACK: usize = 10000;
@@ -55,6 +56,7 @@ struct App {
     view: Id,
     scale: usize,
     font_pt: f64,
+    gamma: f64,
     pty: c_int,
     child: c_int,
     fdref: *mut c_void,
@@ -69,6 +71,7 @@ struct App {
     view_w: f64,
     view_h: f64,
     cwd: String,
+    cmd: String,
 }
 
 impl App {
@@ -189,7 +192,7 @@ fn present() {
         let stride = IOSurfaceGetBytesPerRow(surf) / 4;
         let px = std::slice::from_raw_parts_mut(IOSurfaceGetBaseAddress(surf) as *mut u32, stride * a.fbh);
         let mut fb = Fb { px, w: a.fbw, h: a.fbh, stride, ox: pad, oy: pad };
-        let drew = render::frame(&mut a.t, &mut a.atlas, &mut fb, &a.sel.on, a.focused, &mut a.drawn);
+        let drew = render::frame(&mut a.t, &mut a.atlas, &mut fb, &a.sel.on, a.focused, a.gamma as f32, &mut a.drawn);
         IOSurfaceUnlock(surf, 0, null_mut());
         drew
     };
@@ -241,6 +244,23 @@ fn relayout() {
     present();
 }
 
+fn config_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".config/trm/config"))
+}
+
+fn setting(conf: &str, key: &str) -> Option<f64> {
+    conf.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')?.trim().parse().ok())
+}
+
+fn save_settings() {
+    let Some(p) = config_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let a = app();
+    let _ = std::fs::write(p, format!("font_pt={}\ngamma={}\n", a.font_pt, a.gamma));
+}
+
 fn set_font(delta: f64) {
     let (pt, scale) = {
         let a = app();
@@ -252,6 +272,17 @@ fn set_font(delta: f64) {
     let atlas = Atlas::new(pt * scale as f64);
     app().atlas = atlas;
     relayout();
+    save_settings();
+}
+
+fn set_gamma(delta: f64) {
+    let a = app();
+    let g = (a.gamma + delta).clamp(0.1, 1.0);
+    if g == a.gamma { return }
+    a.gamma = g;
+    a.t.all_dirty = true;
+    schedule_frame();
+    save_settings();
 }
 
 fn pasteboard_set(text: &[u8]) {
@@ -360,6 +391,40 @@ fn fg_cwd() -> Option<String> {
     pid_cwd(unsafe { tcgetpgrp(a.pty) }).or_else(|| pid_cwd(a.child))
 }
 
+// KERN_PROCARGS2 layout: i32 argc, exec_path, nul padding, then argv[0]
+fn argv0(pid: c_int) -> Option<String> {
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
+    let mut buf = vec![0u8; 262144];
+    let mut len = buf.len();
+    let r = unsafe { sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut c_void, &mut len, null_mut(), 0) };
+    if r != 0 || len < 5 { return None }
+    let buf = &buf[..len];
+    let mut i = 4;
+    while i < buf.len() && buf[i] != 0 { i += 1 }
+    while i < buf.len() && buf[i] == 0 { i += 1 }
+    let start = i;
+    while i < buf.len() && buf[i] != 0 { i += 1 }
+    if start == i { return None }
+    Some(String::from_utf8_lossy(&buf[start..i]).into_owned())
+}
+
+fn pname(pid: c_int) -> Option<String> {
+    let mut buf = [0u8; 64];
+    let n = unsafe { proc_name(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+    if n <= 0 { return None }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+fn fg_cmd() -> Option<String> {
+    let a = app();
+    let pid = unsafe { tcgetpgrp(a.pty) };
+    if pid <= 0 || pid == a.child { return None }
+    let name = argv0(pid).or_else(|| pname(pid))?;
+    let base = name.rsplit('/').next().unwrap_or(&name).trim_start_matches('-');
+    if base.is_empty() { return None }
+    Some(base.into())
+}
+
 // the byte the backspace key sends: the tty's current VERASE control char,
 // so line editors that bind backspace from `stty erase` (e.g. python 3.13's
 // pyrepl) agree with us even when a dotfile remaps erase to ^H
@@ -381,10 +446,15 @@ fn tilde(p: &str) -> String {
     }
 }
 
-unsafe fn icon_attrs(pt: f64) -> Id {
+unsafe fn icon_attrs(pt: f64, amber: bool) -> Id {
     let font: Id = msg![Id: cls("NSFont"), "boldSystemFontOfSize:", f64: pt];
+    let color: Id = if amber {
+        msg![Id: cls("NSColor"), "colorWithSRGBRed:green:blue:alpha:", f64: 1.0, f64: 176.0 / 255.0, f64: 0.0, f64: 1.0]
+    } else {
+        msg![Id: cls("NSColor"), "whiteColor"]
+    };
     let keys = [NSFontAttributeName, NSForegroundColorAttributeName];
-    let vals = [font, msg![Id: cls("NSColor"), "whiteColor"]];
+    let vals = [font, color];
     msg![Id: cls("NSDictionary"), "dictionaryWithObjects:forKeys:count:",
         *const Id: vals.as_ptr(), *const Id: keys.as_ptr(), u64: 2]
 }
@@ -425,34 +495,33 @@ fn icon_lines(text: &str) -> Vec<String> {
 }
 
 // Dock and cmd+tab show the live application icon, so drawing the directory
-// name into it is the one switcher surface we can actually update at runtime.
-unsafe fn set_app_icon(lines: &[String]) {
+// name (white) and the running command (amber, smaller) into it is the one
+// switcher surface we can actually update at runtime.
+unsafe fn set_app_icon(lines: &[String], cmd: Option<&str>) {
     let img: Id = msg![Id: msg![Id: cls("NSImage"), "alloc"], "initWithSize:", CGSize: CGSize { w: 512.0, h: 512.0 }];
     let _: () = msg![(): img, "lockFocus"];
     let _: () = msg![(): msg![Id: cls("NSColor"), "blackColor"], "setFill"];
     let rect = CGRect { origin: CGPoint { x: 32.0, y: 32.0 }, size: CGSize { w: 448.0, h: 448.0 } };
     let path: Id = msg![Id: cls("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", CGRect: rect, f64: 96.0, f64: 96.0];
     let _: () = msg![(): path, "fill"];
-    let strs: Vec<Id> = lines.iter().map(|l| nsstr(l)).collect();
-    let probe = icon_attrs(100.0);
+    let mut ls: Vec<(Id, f64, bool)> = lines.iter().map(|l| (nsstr(l), 1.0, false)).collect();
+    if let Some(c) = cmd { ls.push((nsstr(c), 0.55, true)) }
     let mut max_w: f64 = 1.0;
-    let mut lh: f64 = 1.0;
-    for &s in &strs {
-        let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: probe];
+    let mut total_h: f64 = 0.0;
+    let mut hs = Vec::new();
+    for &(s, f, amber) in &ls {
+        let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: icon_attrs(100.0 * f, amber)];
         max_w = max_w.max(sz.w);
-        lh = lh.max(sz.h);
+        hs.push(sz.h);
+        total_h += sz.h;
     }
-    let n = lines.len() as f64;
-    let attrs = icon_attrs((100.0 * (380.0 / max_w).min(380.0 / (lh * n))).min(200.0));
-    let mut ws = Vec::new();
-    let mut lh2: f64 = 1.0;
-    for &s in &strs {
+    let scale = (380.0 / max_w).min(380.0 / total_h).min(2.0);
+    let mut y = (512.0 + total_h * scale) / 2.0;
+    for (&(s, f, amber), h) in ls.iter().zip(hs) {
+        let attrs = icon_attrs(100.0 * f * scale, amber);
         let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: attrs];
-        ws.push(sz.w);
-        lh2 = lh2.max(sz.h);
-    }
-    for (i, (&s, w)) in strs.iter().zip(ws).enumerate() {
-        let p = CGPoint { x: (512.0 - w) / 2.0, y: (512.0 + lh2 * n) / 2.0 - lh2 * (i as f64 + 1.0) };
+        y -= h * scale;
+        let p = CGPoint { x: (512.0 - sz.w) / 2.0, y };
         let _: () = msg![(): s, "drawAtPoint:withAttributes:", CGPoint: p, Id: attrs];
     }
     let _: () = msg![(): img, "unlockFocus"];
@@ -461,20 +530,25 @@ unsafe fn set_app_icon(lines: &[String]) {
     let _: () = msg![(): img, "release"];
 }
 
-extern "C" fn cwd_cb(_t: *mut c_void, _info: *mut c_void) {
+extern "C" fn poll_cb(_t: *mut c_void, _info: *mut c_void) {
     let Some(cwd) = fg_cwd() else { return };
+    let cmd = fg_cmd().unwrap_or_default();
     let a = app();
-    if cwd == a.cwd { return }
+    if cwd == a.cwd && cmd == a.cmd { return }
+    let dir_changed = cwd != a.cwd;
     a.cwd = cwd;
+    a.cmd = cmd;
     let title = tilde(&a.cwd);
     let base = match title.rsplit('/').next() {
         Some("") | None => "/",
         Some(b) => b,
     };
     unsafe {
-        msg![(): a.win, "setTitle:", Id: nsstr(&title)];
-        _LSSetApplicationInformationItem(-2, _LSGetCurrentApplicationASN(), _kLSDisplayNameKey, nsstr(&title), null_mut());
-        set_app_icon(&icon_lines(base));
+        if dir_changed {
+            msg![(): a.win, "setTitle:", Id: nsstr(&title)];
+            _LSSetApplicationInformationItem(-2, _LSGetCurrentApplicationASN(), _kLSDisplayNameKey, nsstr(&title), null_mut());
+        }
+        set_app_icon(&icon_lines(base), (!a.cmd.is_empty()).then_some(&a.cmd));
     }
 }
 
@@ -667,7 +741,7 @@ mod cwd_tests {
                 }
                 let was_all = t.all_dirty;
                 let mut fb = Fb { px: &mut bufs[cur], w, h, stride: w, ox: 4, oy: 4 };
-                let drew = render::frame(&mut t, &mut atlas, &mut fb, &None, true, &mut drawn);
+                let drew = render::frame(&mut t, &mut atlas, &mut fb, &None, true, 0.45, &mut drawn);
                 if !drew { continue }
                 stale[cur].fill(false);
                 stale_all[cur] = false;
@@ -685,7 +759,7 @@ mod cwd_tests {
             rt.all_dirty = true;
             let mut rbuf = vec![0u32; w * h];
             let mut fb = Fb { px: &mut rbuf, w, h, stride: w, ox: 4, oy: 4 };
-            render::frame(&mut rt, &mut atlas, &mut fb, &None, true, &mut drawn);
+            render::frame(&mut rt, &mut atlas, &mut fb, &None, true, 0.45, &mut drawn);
             let diff = bufs[shown].iter().zip(&rbuf).filter(|(a, b)| a != b).count();
             assert_eq!(diff, 0, "chunk={}: {} pixels differ from full redraw", chunk, diff);
         }
@@ -769,6 +843,21 @@ mod cwd_tests {
     }
 
     #[test]
+    fn argv0_of_self() {
+        let name = argv0(std::process::id() as c_int).unwrap();
+        assert!(name.rsplit('/').next().unwrap().starts_with("trm"), "{}", name);
+    }
+
+    #[test]
+    fn settings_parse() {
+        let conf = "font_pt=14.5\ngamma=0.5\njunk\nfont_ptx=9\n";
+        assert_eq!(setting(conf, "font_pt"), Some(14.5));
+        assert_eq!(setting(conf, "gamma"), Some(0.5));
+        assert_eq!(setting(conf, "missing"), None);
+        assert_eq!(setting("font_pt=abc\n", "font_pt"), None);
+    }
+
+    #[test]
     fn icon_wrap() {
         assert_eq!(icon_lines("trm"), ["trm"]);
         assert_eq!(icon_lines("aaaa-bbbb-cccc"), ["aaaa-", "bbbb-", "cccc"]);
@@ -806,7 +895,7 @@ fn pty_spawn(cols: usize, rows: usize) -> (c_int, c_int) {
         let path = CString::new(shell.clone()).unwrap();
         let argv = [arg0.as_ptr(), null()];
         let mut env: Vec<CString> = std::env::vars()
-            .filter(|(k, _)| k != "TERM" && k != "COLORTERM" && k != "TERMCAP" && !k.starts_with("DYLD_"))
+            .filter(|(k, _)| k != "TERM" && k != "COLORTERM" && k != "TERMCAP" && !k.starts_with("DYLD_") && !k.starts_with("TRM_"))
             .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap())
             .collect();
         env.push(CString::new("TERM=xterm-256color").unwrap());
@@ -900,14 +989,18 @@ extern "C" fn v_key_down(this: Id, _c: SEL, ev: Id) {
         Act::Copy => copy_selection(),
         Act::Paste => paste(),
         Act::Font(d) => set_font(d),
+        Act::Gamma(d) => set_gamma(d),
         Act::NewWindow => {
             if let Ok(exe) = std::env::current_exe() {
-                let pt = format!("{}", app().font_pt);
+                let (pt, gamma) = {
+                    let a = app();
+                    (format!("{}", a.font_pt), format!("{}", a.gamma))
+                };
                 let mut cmd = std::process::Command::new(&exe);
-                cmd.arg(&pt);
+                cmd.env("TRM_FONT_PT", &pt).env("TRM_GAMMA", &gamma);
                 if let Some(cwd) = fg_cwd() { cmd.current_dir(cwd); }
                 if cmd.spawn().is_err() {
-                    let _ = std::process::Command::new(exe).arg(&pt).spawn();
+                    let _ = std::process::Command::new(exe).env("TRM_FONT_PT", &pt).env("TRM_GAMMA", &gamma).spawn();
                 }
             }
         }
@@ -1131,10 +1224,17 @@ fn main() {
         let screen: Id = msg![Id: cls("NSScreen"), "mainScreen"];
         let sf: f64 = if screen.is_null() { 2.0 } else { msg![f64: screen, "backingScaleFactor"] };
         let scale = if sf > 1.5 { 2usize } else { 1 };
-        let font_pt = std::env::args().nth(1)
-            .and_then(|a| a.parse::<f64>().ok())
+        let conf = config_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let font_pt = std::env::var("TRM_FONT_PT").ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| setting(&conf, "font_pt"))
             .filter(|p| p.is_finite())
             .map_or(FONT_PT, |p| p.max(1.0));
+        let gamma = std::env::var("TRM_GAMMA").ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| setting(&conf, "gamma"))
+            .filter(|g| g.is_finite())
+            .map_or(GAMMA, |g| g.clamp(0.1, 1.0));
         let atlas = Atlas::new(font_pt * scale as f64);
 
         let pad = (atlas.cw / 3).max(2);
@@ -1167,7 +1267,7 @@ fn main() {
             stale: [vec![], vec![]], stale_all: [true; 2], drawn: vec![],
             fbw: 0, fbh: 0,
             win, layer, view,
-            scale, font_pt,
+            scale, font_pt, gamma,
             pty, child, fdref: null_mut(),
             outq: VecDeque::new(),
             frame_scheduled: false, sync_since: 0.0,
@@ -1176,6 +1276,7 @@ fn main() {
             scroll_acc: 0.0, focused: true, ready: false,
             view_w: w, view_h: h,
             cwd: String::new(),
+            cmd: String::new(),
         }));
 
         let fdref = CFFileDescriptorCreate(null(), pty, false, pty_cb, null_mut());
@@ -1185,7 +1286,7 @@ fn main() {
         CFRelease(src);
         CFFileDescriptorEnableCallBacks(fdref, FD_READ_CB);
 
-        let cwt = CFRunLoopTimerCreate(null(), CFAbsoluteTimeGetCurrent(), 0.5, 0, 0, cwd_cb, null_mut());
+        let cwt = CFRunLoopTimerCreate(null(), CFAbsoluteTimeGetCurrent(), 0.5, 0, 0, poll_cb, null_mut());
         CFRunLoopAddTimer(CFRunLoopGetMain(), cwt, kCFRunLoopCommonModes);
         CFRelease(cwt);
 
