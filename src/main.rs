@@ -455,7 +455,7 @@ fn tilde(p: &str) -> String {
 }
 
 unsafe fn icon_attrs(pt: f64, amber: bool) -> Id {
-    let font: Id = msg![Id: cls("NSFont"), "boldSystemFontOfSize:", f64: pt];
+    let font: Id = msg![Id: cls("NSFont"), "monospacedSystemFontOfSize:weight:", f64: pt, f64: 0.4];
     let color: Id = if amber {
         msg![Id: cls("NSColor"), "colorWithSRGBRed:green:blue:alpha:", f64: 1.0, f64: 176.0 / 255.0, f64: 0.0, f64: 1.0]
     } else {
@@ -467,70 +467,34 @@ unsafe fn icon_attrs(pt: f64, amber: bool) -> Id {
         *const Id: vals.as_ptr(), *const Id: keys.as_ptr(), u64: 2]
 }
 
-fn icon_lines(text: &str) -> Vec<String> {
-    if text.chars().count() <= 6 { return vec![text.into()] }
-    let mut toks: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for ch in text.chars() {
-        cur.push(ch);
-        if matches!(ch, '-' | '_' | '.' | ' ') {
-            toks.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() { toks.push(cur) }
-    let mut split: Vec<String> = Vec::new();
-    for t in toks {
-        let len = t.chars().count();
-        if len <= 8 {
-            split.push(t);
-        } else {
-            let per = len.div_ceil(len.div_ceil(8));
-            let chars: Vec<char> = t.chars().collect();
-            split.extend(chars.chunks(per).map(|c| c.iter().collect::<String>()));
-        }
-    }
-    let mut lines: Vec<String> = vec![String::new()];
-    for t in split {
-        let n = lines.len();
-        let last = lines.last_mut().unwrap();
-        if !last.is_empty() && last.chars().count() + t.chars().count() > 8 && n < 3 {
-            lines.push(t);
-        } else {
-            last.push_str(&t);
-        }
-    }
-    lines
+fn icon8(text: &str) -> String {
+    if text.chars().count() <= 8 { return text.into() }
+    let mut s: String = text.chars().take(7).collect();
+    s.push('~');
+    s
 }
 
 // Dock and cmd+tab show the live application icon, so drawing the directory
 // name (white) and the running command (amber, smaller) into it is the one
 // switcher surface we can actually update at runtime.
-unsafe fn set_app_icon(lines: &[String], cmd: Option<&str>) {
+unsafe fn set_app_icon(dir: &str, cmd: Option<&str>) {
     let img: Id = msg![Id: msg![Id: cls("NSImage"), "alloc"], "initWithSize:", CGSize: CGSize { w: 512.0, h: 512.0 }];
     let _: () = msg![(): img, "lockFocus"];
     let _: () = msg![(): msg![Id: cls("NSColor"), "blackColor"], "setFill"];
     let rect = CGRect { origin: CGPoint { x: 32.0, y: 32.0 }, size: CGSize { w: 448.0, h: 448.0 } };
     let path: Id = msg![Id: cls("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", CGRect: rect, f64: 96.0, f64: 96.0];
     let _: () = msg![(): path, "fill"];
-    let mut ls: Vec<(Id, f64, bool)> = lines.iter().map(|l| (nsstr(l), 1.0, false)).collect();
-    if let Some(c) = cmd { ls.push((nsstr(c), 0.55, true)) }
-    let mut max_w: f64 = 1.0;
-    let mut total_h: f64 = 0.0;
-    let mut hs = Vec::new();
-    for &(s, f, amber) in &ls {
-        let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: icon_attrs(100.0 * f, amber)];
-        max_w = max_w.max(sz.w);
-        hs.push(sz.h);
-        total_h += sz.h;
-    }
-    let scale = (380.0 / max_w).min(380.0 / total_h).min(2.0);
-    let mut y = (512.0 + total_h * scale) / 2.0;
-    for (&(s, f, amber), h) in ls.iter().zip(hs) {
-        let attrs = icon_attrs(100.0 * f * scale, amber);
+    let probe: CGSize = msg![CGSize: nsstr("00000000"), "sizeWithAttributes:", Id: icon_attrs(100.0, false)];
+    let dir_pt = 100.0 * 380.0 / probe.w;
+    let cmd_pt = dir_pt * 0.55;
+    let (dir_h, cmd_h) = (probe.h * dir_pt / 100.0, probe.h * cmd_pt / 100.0);
+    let top = (512.0 + dir_h + cmd_h) / 2.0;
+    for (text, pt, amber, y) in [(dir, dir_pt, false, top - dir_h), (cmd.unwrap_or(""), cmd_pt, true, top - dir_h - cmd_h)] {
+        if text.is_empty() { continue }
+        let attrs = icon_attrs(pt, amber);
+        let s = nsstr(text);
         let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: attrs];
-        y -= h * scale;
-        let p = CGPoint { x: (512.0 - sz.w) / 2.0, y };
-        let _: () = msg![(): s, "drawAtPoint:withAttributes:", CGPoint: p, Id: attrs];
+        let _: () = msg![(): s, "drawAtPoint:withAttributes:", CGPoint: CGPoint { x: (512.0 - sz.w) / 2.0, y }, Id: attrs];
     }
     let _: () = msg![(): img, "unlockFocus"];
     let nsapp: Id = msg![Id: cls("NSApplication"), "sharedApplication"];
@@ -556,7 +520,7 @@ extern "C" fn poll_cb(_t: *mut c_void, _info: *mut c_void) {
             msg![(): a.win, "setTitle:", Id: nsstr(&title)];
             _LSSetApplicationInformationItem(-2, _LSGetCurrentApplicationASN(), _kLSDisplayNameKey, nsstr(&title), null_mut());
         }
-        set_app_icon(&icon_lines(base), (!a.cmd.is_empty()).then_some(&a.cmd));
+        set_app_icon(&icon8(base), (!a.cmd.is_empty()).then(|| icon8(&a.cmd)).as_deref());
     }
 }
 
@@ -881,13 +845,12 @@ mod cwd_tests {
     }
 
     #[test]
-    fn icon_wrap() {
-        assert_eq!(icon_lines("trm"), ["trm"]);
-        assert_eq!(icon_lines("aaaa-bbbb-cccc"), ["aaaa-", "bbbb-", "cccc"]);
-        assert_eq!(icon_lines("claude-code"), ["claude-", "code"]);
-        assert_eq!(icon_lines("superpowers"), ["superp", "owers"]);
-        assert_eq!(icon_lines("a-b-c-d-e"), ["a-b-c-d-", "e"]);
-        assert_eq!(icon_lines("~"), ["~"]);
+    fn icon_truncate() {
+        assert_eq!(icon8("trm"), "trm");
+        assert_eq!(icon8("12345678"), "12345678");
+        assert_eq!(icon8("superpowers"), "superpo~");
+        assert_eq!(icon8("customer-match"), "custome~");
+        assert_eq!(icon8("~"), "~");
     }
 
     #[test]

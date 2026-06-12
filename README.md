@@ -95,7 +95,7 @@ make test       # golden tests, fuzz smoke, benchmarks
 
 Benchmarks print with
 `cargo test --release bench -- --nocapture`
-(~330 MB/s parse, ~2 ms worst-case full frame).
+(~390 MB/s parse, ~2 ms worst-case full frame).
 
 ## Usage
 

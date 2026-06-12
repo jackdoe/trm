@@ -23,7 +23,7 @@ pub struct Font {
     hmtx: usize,
     cmap4: Option<usize>,
     cmap12: Option<usize>,
-    num_glyphs: u16,
+    pub num_glyphs: u16,
     num_h_metrics: u16,
     long_loca: bool,
     pub units_per_em: u16,

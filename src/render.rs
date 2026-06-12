@@ -8,7 +8,8 @@ pub struct Atlas {
     pub base: usize,
     px_em: f32,
     font: Font,
-    glyphs: HashMap<u32, Option<Vec<u8>>>,
+    ascii: [u16; 95],
+    glyphs: Vec<Option<Vec<u8>>>,
     proc: HashMap<(u32, bool), Vec<u8>>,
 }
 
@@ -24,14 +25,18 @@ fn phosphor(l: f32) -> u32 {
     ((PHOSPHOR.0 * l) as u32) << 16 | ((PHOSPHOR.1 * l) as u32) << 8 | (PHOSPHOR.2 * l) as u32
 }
 
-fn amber_fg(rgb: u32, gamma: f32) -> u32 {
-    let l = luma(rgb);
-    if l < 0.02 { return phosphor(l) }
-    phosphor(l.powf(gamma))
+fn amber_luts(gamma: f32) -> ([u32; 256], [u32; 256]) {
+    (
+        std::array::from_fn(|i| {
+            let l = i as f32 / 255.0;
+            phosphor(if l < 0.02 { l } else { l.powf(gamma) })
+        }),
+        std::array::from_fn(|i| phosphor((i as f32 / 255.0).powf(1.3))),
+    )
 }
 
-fn amber_bg(rgb: u32) -> u32 {
-    phosphor(luma(rgb).powf(1.3))
+fn amber(lut: &[u32; 256], rgb: u32) -> u32 {
+    lut[(luma(rgb) * 255.0 + 0.5) as usize]
 }
 
 fn is_proc(cp: u32) -> bool {
@@ -50,27 +55,29 @@ impl Atlas {
         let gap = font.line_gap as f32 * scale;
         let ch = ((asc - desc + gap).ceil() as usize).max(1);
         let base = (asc + gap / 2.0).round() as usize;
-        Atlas { cw, ch, base, px_em, font, glyphs: HashMap::new(), proc: HashMap::new() }
+        let ascii: [u16; 95] = std::array::from_fn(|i| font.glyph_index(i as u32 + 0x20));
+        let glyphs = vec![None; font.num_glyphs as usize];
+        Atlas { cw, ch, base, px_em, font, ascii, glyphs, proc: HashMap::new() }
     }
 
-    fn ensure(&mut self, cp: u32) -> bool {
-        let (cw, ch, base, px_em) = (self.cw, self.ch, self.base, self.px_em);
-        let f = &self.font;
-        self.glyphs
-            .entry(cp)
-            .or_insert_with(|| {
-                let gi = f.glyph_index(cp);
-                if gi == 0 { return None }
-                let scale = px_em / f.units_per_em as f32;
-                let adv = f.advance(gi) as f32 * scale;
-                let x_off = ((cw as f32 - adv) / 2.0).max(0.0);
-                Some(font::rasterize(f, gi, scale, cw, ch, x_off, base as f32))
-            })
-            .is_some()
+    fn ensure(&mut self, cp: u32) -> u16 {
+        let gi = if (0x20..0x7f).contains(&cp) {
+            self.ascii[(cp - 0x20) as usize]
+        } else {
+            self.font.glyph_index(cp)
+        };
+        if gi == 0 || gi as usize >= self.glyphs.len() { return 0 }
+        if self.glyphs[gi as usize].is_none() {
+            let scale = self.px_em / self.font.units_per_em as f32;
+            let adv = self.font.advance(gi) as f32 * scale;
+            let x_off = ((self.cw as f32 - adv) / 2.0).max(0.0);
+            self.glyphs[gi as usize] = Some(font::rasterize(&self.font, gi, scale, self.cw, self.ch, x_off, self.base as f32));
+        }
+        gi
     }
 
-    fn glyph(&self, cp: u32) -> &[u8] {
-        self.glyphs[&cp].as_deref().unwrap_or(&[])
+    fn glyph(&self, gi: u16) -> &[u8] {
+        self.glyphs[gi as usize].as_deref().unwrap_or(&[])
     }
 
     fn proc_cached(&mut self, cp: u32, wide: bool, lt: i64) -> &[u8] {
@@ -350,7 +357,8 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
     drawn.clear();
     drawn.resize(t.rows, false);
     let mut drew = t.all_dirty;
-    let def_bg = amber_bg(t.def_bg);
+    let (fg_lut, bg_lut) = amber_luts(gamma);
+    let def_bg = amber(&bg_lut, t.def_bg);
     if t.all_dirty {
         fb.fill_at(0, 0, fb.w, fb.oy, def_bg);
         let bot = fb.oy + t.rows * ch;
@@ -386,21 +394,24 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             }
             let cursor = cursor_row && x == t.x;
             if cursor && focused { std::mem::swap(&mut fg, &mut bg) }
-            let (fg, bg) = (amber_fg(fg, gamma), amber_bg(bg));
+            let (fg, bg) = (amber(&fg_lut, fg), amber(&bg_lut, bg));
             fb.fill(px, py, cell_w, ch, bg);
             if c.cp != 0 && c.cp != b' ' as u32 {
                 if is_proc(c.cp) {
                     let g = atlas.proc_cached(c.cp, wide, lt);
                     fb.blend_cov(px, py, g, cell_w, ch, fg, 0);
-                } else if !wide && atlas.ensure(c.cp) {
-                    let g = atlas.glyph(c.cp);
-                    fb.blend_cov(px, py, g, cw, ch, fg, 0);
-                    if c.attr & vt::BOLD != 0 {
-                        fb.blend_cov(px, py, g, cw, ch, fg, 1);
-                    }
                 } else {
-                    let g = atlas.proc_cached(HOLLOW, wide, lt);
-                    fb.blend_cov(px, py, g, cell_w, ch, fg, 0);
+                    let gi = if wide { 0 } else { atlas.ensure(c.cp) };
+                    if gi != 0 {
+                        let g = atlas.glyph(gi);
+                        fb.blend_cov(px, py, g, cw, ch, fg, 0);
+                        if c.attr & vt::BOLD != 0 {
+                            fb.blend_cov(px, py, g, cw, ch, fg, 1);
+                        }
+                    } else {
+                        let g = atlas.proc_cached(HOLLOW, wide, lt);
+                        fb.blend_cov(px, py, g, cell_w, ch, fg, 0);
+                    }
                 }
             }
             if c.attr & vt::UNDER != 0 {
@@ -412,7 +423,7 @@ pub fn frame(t: &mut Term, atlas: &mut Atlas, fb: &mut Fb, sel: &Span, focused: 
             }
             if cursor && !focused {
                 let g = atlas.proc_cached(OUTLINE, wide, lt);
-                let c = amber_fg(t.def_fg, gamma);
+                let c = amber(&fg_lut, t.def_fg);
                 fb.blend_cov(px, py, g, cell_w, ch, c, 0);
             }
             x += if wide { 2 } else { 1 };

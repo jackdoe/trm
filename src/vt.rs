@@ -255,27 +255,34 @@ impl Term {
         while cells.last().is_some_and(|c| !Self::non_blank(c, def_bg)) { cells.pop(); }
     }
 
-    fn sb_push(&mut self, mut line: Line) {
-        if self.sb_cap == 0 || self.alt != 0 { return }
+    fn sb_push(&mut self, mut line: Line) -> Option<Line> {
+        if self.sb_cap == 0 || self.alt != 0 { return Some(line) }
         if !line.wrapped { Self::trim_blank(&mut line.cells, self.def_bg) }
-        if self.sb.len() == self.sb_cap {
-            self.sb.pop_front();
+        let evicted = if self.sb.len() == self.sb_cap {
             self.sb_base += 1;
-        }
+            self.sb.pop_front()
+        } else {
+            None
+        };
         self.sb.push_back(line);
         if self.view > 0 { self.view = (self.view + 1).min(self.sb.len()) }
+        evicted
     }
 
     fn scroll_up(&mut self, top: usize, bot: usize, n: usize, to_sb: bool) {
         let n = n.min(bot - top + 1);
         if n == 0 { return }
+        let b = self.blank();
         if to_sb && self.alt == 0 && top == 0 && bot == self.rows - 1 {
             for i in 0..n {
-                let l = self.screens[self.alt][top + i].clone();
-                self.sb_push(l);
+                let l = std::mem::replace(&mut self.screens[0][top + i], Line { cells: vec![], wrapped: false });
+                let mut fresh = self.sb_push(l).unwrap_or(Line { cells: vec![], wrapped: false });
+                fresh.cells.clear();
+                fresh.cells.resize(self.cols, b);
+                fresh.wrapped = false;
+                self.screens[0][top + i] = fresh;
             }
         }
-        let b = self.blank();
         self.screens[self.alt][top..=bot].rotate_left(n);
         for l in &mut self.screens[self.alt][bot + 1 - n..=bot] {
             l.cells.fill(b);
