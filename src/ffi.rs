@@ -75,6 +75,20 @@ pub const SIG_IGN: usize = 1;
 pub const FD_READ_CB: u64 = 1;
 pub const FD_WRITE_CB: u64 = 2;
 
+pub const PROC_PIDVNODEPATHINFO: c_int = 9;
+pub const VERASE: usize = 3;
+
+#[repr(C)]
+pub struct Termios {
+    pub iflag: u64,
+    pub oflag: u64,
+    pub cflag: u64,
+    pub lflag: u64,
+    pub cc: [u8; 20],
+    pub ispeed: u64,
+    pub ospeed: u64,
+}
+
 #[link(name = "objc")]
 extern "C" {
     pub fn objc_msgSend();
@@ -95,6 +109,8 @@ extern "C" {
 extern "C" {
     pub static NSPasteboardTypeString: Id;
     pub static NSPasteboardTypeFileURL: Id;
+    pub static NSFontAttributeName: Id;
+    pub static NSForegroundColorAttributeName: Id;
 }
 
 #[link(name = "QuartzCore", kind = "framework")]
@@ -142,6 +158,15 @@ extern "C" {
     pub static kIOSurfacePixelFormat: Id;
 }
 
+// Private LaunchServices SPI: renames this process in the Dock and cmd+tab
+// switcher at runtime (same mechanism Chromium uses for its helper processes).
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    pub fn _LSGetCurrentApplicationASN() -> Id;
+    pub fn _LSSetApplicationInformationItem(session: c_int, asn: Id, key: Id, value: Id, out: *mut Id) -> i32;
+    pub static _kLSDisplayNameKey: Id;
+}
+
 extern "C" {
     pub fn posix_openpt(flags: c_int) -> c_int;
     pub fn grantpt(fd: c_int) -> c_int;
@@ -161,6 +186,11 @@ extern "C" {
     pub fn signal(sig: c_int, handler: usize) -> usize;
     pub fn getuid() -> u32;
     pub fn getpwuid(uid: u32) -> *mut Passwd;
+    pub fn tcgetpgrp(fd: c_int) -> c_int;
+    pub fn tcgetattr(fd: c_int, t: *mut Termios) -> c_int;
+    #[cfg(test)]
+    pub fn tcsetattr(fd: c_int, action: c_int, t: *const Termios) -> c_int;
+    pub fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *mut c_void, buffersize: c_int) -> c_int;
     pub fn __error() -> *mut c_int;
 }
 

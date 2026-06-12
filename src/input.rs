@@ -44,7 +44,7 @@ fn tilde_key(code: u32, mods: u64) -> Act {
     }
 }
 
-pub fn key(ch: u16, mods: u64, m: &Modes) -> Act {
+pub fn key(ch: u16, mods: u64, m: &Modes, erase: u8) -> Act {
     if mods & CMD != 0 {
         return match ch as u8 {
             b'q' => Act::Quit,
@@ -69,9 +69,9 @@ pub fn key(ch: u16, mods: u64, m: &Modes) -> Act {
         0x0d => Act::Write(if mods & ALT != 0 { b"\x1b\r".into() } else { b"\r".into() }),
         0x09 if mods & SHIFT != 0 => Act::Write(b"\x1b[Z".into()),
         0x09 => Act::Write(b"\t".into()),
-        0x7f if mods & ALT != 0 => Act::Write(b"\x1b\x7f".into()),
+        0x7f if mods & ALT != 0 => Act::Write(vec![0x1b, erase]),
         0x7f if mods & CTRL != 0 => Act::Write(b"\x08".into()),
-        0x7f => Act::Write(b"\x7f".into()),
+        0x7f => Act::Write(vec![erase]),
         0x1b if mods & ALT != 0 => Act::Write(b"\x1b\x1b".into()),
         0x1b => Act::Write(b"\x1b".into()),
         _ if mods & CTRL != 0 => {

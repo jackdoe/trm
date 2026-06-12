@@ -56,6 +56,7 @@ struct App {
     scale: usize,
     font_pt: f64,
     pty: c_int,
+    child: c_int,
     fdref: *mut c_void,
     outq: VecDeque<u8>,
     frame_scheduled: bool,
@@ -67,7 +68,7 @@ struct App {
     ready: bool,
     view_w: f64,
     view_h: f64,
-    title: String,
+    cwd: String,
 }
 
 impl App {
@@ -243,7 +244,7 @@ fn relayout() {
 fn set_font(delta: f64) {
     let (pt, scale) = {
         let a = app();
-        let pt = (a.font_pt + delta).clamp(6.0, 32.0);
+        let pt = (a.font_pt + delta).max(1.0);
         if pt == a.font_pt { return }
         a.font_pt = pt;
         (pt, a.scale)
@@ -273,7 +274,7 @@ fn copy_selection() {
 
 extern "C" fn flash_cb(_t: *mut c_void, _info: *mut c_void) {
     let a = app();
-    unsafe { msg![(): a.win, "setTitle:", Id: nsstr(&a.title)] }
+    unsafe { msg![(): a.win, "setTitle:", Id: nsstr(&tilde(&a.cwd))] }
 }
 
 fn clip_flash(n: usize) {
@@ -299,20 +300,16 @@ fn paste() {
 }
 
 fn app_feed(buf: &[u8]) {
-    let (out, title, clip) = {
+    let (out, clip) = {
         let a = app();
         a.t.feed(buf);
         if a.sel.on.is_some() && !a.sel.dragging {
             a.sel.on = None;
             a.t.all_dirty = true;
         }
-        (std::mem::take(&mut a.t.out), a.t.title.take(), a.t.clip.take())
+        (std::mem::take(&mut a.t.out), a.t.clip.take())
     };
     if !out.is_empty() { pty_write(&out) }
-    if let Some(s) = title {
-        app().title = s.clone();
-        unsafe { msg![(): app().win, "setTitle:", Id: nsstr(&s)] }
-    }
     if let Some(c) = clip {
         pasteboard_set(&c);
         clip_flash(c.len());
@@ -345,7 +342,453 @@ extern "C" fn pty_cb(fdref: *mut c_void, flags: u64, _info: *mut c_void) {
     }
 }
 
-fn pty_spawn(cols: usize, rows: usize) -> c_int {
+// proc_vnodepathinfo: pvi_cdir.vip_path (1024 bytes) sits at offset 152, after
+// the vnode_info header; pvi_rdir follows, for 2352 bytes total.
+fn pid_cwd(pid: c_int) -> Option<String> {
+    if pid <= 0 { return None }
+    let mut buf = [0u8; 2352];
+    let n = unsafe { proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, buf.as_mut_ptr() as *mut c_void, buf.len() as c_int) };
+    if n < 1176 { return None }
+    let path = &buf[152..1176];
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    if end == 0 { return None }
+    Some(String::from_utf8_lossy(&path[..end]).into_owned())
+}
+
+fn fg_cwd() -> Option<String> {
+    let a = app();
+    pid_cwd(unsafe { tcgetpgrp(a.pty) }).or_else(|| pid_cwd(a.child))
+}
+
+// the byte the backspace key sends: the tty's current VERASE control char,
+// so line editors that bind backspace from `stty erase` (e.g. python 3.13's
+// pyrepl) agree with us even when a dotfile remaps erase to ^H
+fn erase_byte(fd: c_int) -> u8 {
+    let mut tio = Termios { iflag: 0, oflag: 0, cflag: 0, lflag: 0, cc: [0; 20], ispeed: 0, ospeed: 0 };
+    let e = if unsafe { tcgetattr(fd, &mut tio) } == 0 { tio.cc[VERASE] } else { 0x7f };
+    if e == 0 || e == 0xff { 0x7f } else { e }
+}
+
+fn erase_char() -> u8 {
+    erase_byte(app().pty)
+}
+
+fn tilde(p: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if p == h => "~".into(),
+        Ok(h) if p.starts_with(&h) && p.as_bytes().get(h.len()) == Some(&b'/') => format!("~{}", &p[h.len()..]),
+        _ => p.into(),
+    }
+}
+
+unsafe fn icon_attrs(pt: f64) -> Id {
+    let font: Id = msg![Id: cls("NSFont"), "boldSystemFontOfSize:", f64: pt];
+    let keys = [NSFontAttributeName, NSForegroundColorAttributeName];
+    let vals = [font, msg![Id: cls("NSColor"), "whiteColor"]];
+    msg![Id: cls("NSDictionary"), "dictionaryWithObjects:forKeys:count:",
+        *const Id: vals.as_ptr(), *const Id: keys.as_ptr(), u64: 2]
+}
+
+fn icon_lines(text: &str) -> Vec<String> {
+    if text.chars().count() <= 6 { return vec![text.into()] }
+    let mut toks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        cur.push(ch);
+        if matches!(ch, '-' | '_' | '.' | ' ') {
+            toks.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() { toks.push(cur) }
+    let mut split: Vec<String> = Vec::new();
+    for t in toks {
+        let len = t.chars().count();
+        if len <= 8 {
+            split.push(t);
+        } else {
+            let per = len.div_ceil(len.div_ceil(8));
+            let chars: Vec<char> = t.chars().collect();
+            split.extend(chars.chunks(per).map(|c| c.iter().collect::<String>()));
+        }
+    }
+    let mut lines: Vec<String> = vec![String::new()];
+    for t in split {
+        let n = lines.len();
+        let last = lines.last_mut().unwrap();
+        if !last.is_empty() && last.chars().count() + t.chars().count() > 8 && n < 3 {
+            lines.push(t);
+        } else {
+            last.push_str(&t);
+        }
+    }
+    lines
+}
+
+// Dock and cmd+tab show the live application icon, so drawing the directory
+// name into it is the one switcher surface we can actually update at runtime.
+unsafe fn set_app_icon(lines: &[String]) {
+    let img: Id = msg![Id: msg![Id: cls("NSImage"), "alloc"], "initWithSize:", CGSize: CGSize { w: 512.0, h: 512.0 }];
+    let _: () = msg![(): img, "lockFocus"];
+    let _: () = msg![(): msg![Id: cls("NSColor"), "blackColor"], "setFill"];
+    let rect = CGRect { origin: CGPoint { x: 32.0, y: 32.0 }, size: CGSize { w: 448.0, h: 448.0 } };
+    let path: Id = msg![Id: cls("NSBezierPath"), "bezierPathWithRoundedRect:xRadius:yRadius:", CGRect: rect, f64: 96.0, f64: 96.0];
+    let _: () = msg![(): path, "fill"];
+    let strs: Vec<Id> = lines.iter().map(|l| nsstr(l)).collect();
+    let probe = icon_attrs(100.0);
+    let mut max_w: f64 = 1.0;
+    let mut lh: f64 = 1.0;
+    for &s in &strs {
+        let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: probe];
+        max_w = max_w.max(sz.w);
+        lh = lh.max(sz.h);
+    }
+    let n = lines.len() as f64;
+    let attrs = icon_attrs((100.0 * (380.0 / max_w).min(380.0 / (lh * n))).min(200.0));
+    let mut ws = Vec::new();
+    let mut lh2: f64 = 1.0;
+    for &s in &strs {
+        let sz: CGSize = msg![CGSize: s, "sizeWithAttributes:", Id: attrs];
+        ws.push(sz.w);
+        lh2 = lh2.max(sz.h);
+    }
+    for (i, (&s, w)) in strs.iter().zip(ws).enumerate() {
+        let p = CGPoint { x: (512.0 - w) / 2.0, y: (512.0 + lh2 * n) / 2.0 - lh2 * (i as f64 + 1.0) };
+        let _: () = msg![(): s, "drawAtPoint:withAttributes:", CGPoint: p, Id: attrs];
+    }
+    let _: () = msg![(): img, "unlockFocus"];
+    let nsapp: Id = msg![Id: cls("NSApplication"), "sharedApplication"];
+    let _: () = msg![(): nsapp, "setApplicationIconImage:", Id: img];
+    let _: () = msg![(): img, "release"];
+}
+
+extern "C" fn cwd_cb(_t: *mut c_void, _info: *mut c_void) {
+    let Some(cwd) = fg_cwd() else { return };
+    let a = app();
+    if cwd == a.cwd { return }
+    a.cwd = cwd;
+    let title = tilde(&a.cwd);
+    let base = match title.rsplit('/').next() {
+        Some("") | None => "/",
+        Some(b) => b,
+    };
+    unsafe {
+        msg![(): a.win, "setTitle:", Id: nsstr(&title)];
+        _LSSetApplicationInformationItem(-2, _LSGetCurrentApplicationASN(), _kLSDisplayNameKey, nsstr(&title), null_mut());
+        set_app_icon(&icon_lines(base));
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    fn row(t: &Term, y: usize) -> String {
+        let mut s = String::new();
+        for c in &t.line(y).cells {
+            if c.attr & vt::TAIL != 0 { continue }
+            s.push(char::from_u32(if c.cp == 0 { '.' as u32 } else { c.cp }).unwrap_or('?'));
+        }
+        s.trim_end_matches('.').to_string()
+    }
+
+    // full pipeline: real python under a real pty, output pumped through Term
+    // exactly like pty_cb does, terminal responses written back
+    fn repl_backspace(python: &str, extra_arg: Option<&str>) -> (String, usize) {
+        unsafe {
+            let m = posix_openpt(O_RDWR | O_NOCTTY);
+            assert!(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0);
+            let sname = CStr::from_ptr(ptsname(m)).to_owned();
+            let ws = Winsize { row: 30, col: 100, xpix: 0, ypix: 0 };
+            ioctl(m, TIOCSWINSZ, &ws);
+            let pid = fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                setsid();
+                let s = open(sname.as_ptr(), O_RDWR);
+                ioctl(s, TIOCSCTTY, 0u64);
+                dup2(s, 0); dup2(s, 1); dup2(s, 2);
+                let path = CString::new(python).unwrap();
+                let arg0 = CString::new(python).unwrap();
+                let q = CString::new(extra_arg.unwrap_or("-q")).unwrap();
+                let argv = [arg0.as_ptr(), q.as_ptr(), null()];
+                let term = CString::new("TERM=xterm-256color").unwrap();
+                let home = CString::new(format!("HOME={}", std::env::var("HOME").unwrap())).unwrap();
+                let envp = [term.as_ptr(), home.as_ptr(), null()];
+                execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                _exit(127);
+            }
+            fcntl(m, F_SETFL, O_NONBLOCK);
+            let mut t = Term::new(100, 30, 100, 0xffffff, 0);
+            let pump = |t: &mut Term, secs: f64| {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+                while std::time::Instant::now() < end {
+                    let mut buf = [0u8; 65536];
+                    let n = read(m, buf.as_mut_ptr() as *mut c_void, buf.len());
+                    if n > 0 {
+                        t.feed(&buf[..n as usize]);
+                        let out = std::mem::take(&mut t.out);
+                        if !out.is_empty() { write(m, out.as_ptr() as *const c_void, out.len()); }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            };
+            pump(&mut t, 3.0);
+            // push the prompt to the bottom row so scrollback is in play
+            let cmd: &[u8] = b"print('x\\n' * 40)\r";
+            write(m, cmd.as_ptr() as *const c_void, cmd.len());
+            pump(&mut t, 2.0);
+            write(m, b"abc".as_ptr() as *const c_void, 3);
+            pump(&mut t, 1.0);
+            write(m, b"\x7f".as_ptr() as *const c_void, 1);
+            pump(&mut t, 1.0);
+            for y in 0..t.rows { eprintln!("{:2}|{}|", y, row(&t, y)) }
+            eprintln!("cursor: y={} x={}", t.y, t.x);
+            let r = (row(&t, t.y), t.x);
+            write(m, b"\x04".as_ptr() as *const c_void, 1);
+            pump(&mut t, 0.3);
+            close(m);
+            r
+        }
+    }
+
+    // type past the right margin so the input wraps, then backspace across
+    // the wrap boundary — classic ghost-space territory
+    #[test]
+    fn python_wrapped_backspace_e2e() {
+        unsafe {
+            let m = posix_openpt(O_RDWR | O_NOCTTY);
+            assert!(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0);
+            let sname = CStr::from_ptr(ptsname(m)).to_owned();
+            let ws = Winsize { row: 30, col: 100, xpix: 0, ypix: 0 };
+            ioctl(m, TIOCSWINSZ, &ws);
+            let pid = fork();
+            if pid == 0 {
+                setsid();
+                let s = open(sname.as_ptr(), O_RDWR);
+                ioctl(s, TIOCSCTTY, 0u64);
+                dup2(s, 0); dup2(s, 1); dup2(s, 2);
+                let path = CString::new("/opt/homebrew/bin/python3").unwrap();
+                let q = CString::new("-q").unwrap();
+                let argv = [path.as_ptr(), q.as_ptr(), null()];
+                let term = CString::new("TERM=xterm-256color").unwrap();
+                let envp = [term.as_ptr(), null()];
+                execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                _exit(127);
+            }
+            fcntl(m, F_SETFL, O_NONBLOCK);
+            let mut t = Term::new(100, 30, 100, FG, BG);
+            let pump = |t: &mut Term, secs: f64| {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+                while std::time::Instant::now() < end {
+                    let mut buf = [0u8; 65536];
+                    let n = read(m, buf.as_mut_ptr() as *mut c_void, buf.len());
+                    if n > 0 {
+                        t.feed(&buf[..n as usize]);
+                        let out = std::mem::take(&mut t.out);
+                        if !out.is_empty() { write(m, out.as_ptr() as *const c_void, out.len()); }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            };
+            pump(&mut t, 2.0);
+            let line = [b'a'; 110];
+            write(m, line.as_ptr() as *const c_void, line.len());
+            pump(&mut t, 1.5);
+            // delete back across the wrap boundary: 110 - 20 = 90 chars left
+            for _ in 0..20 {
+                write(m, b"\x7f".as_ptr() as *const c_void, 1);
+                pump(&mut t, 0.05);
+            }
+            pump(&mut t, 1.0);
+            for y in 0..t.rows { eprintln!("{:2}|{}|", y, row(&t, y)) }
+            eprintln!("cursor: y={} x={}", t.y, t.x);
+            // pyrepl soft-wraps with a `\` continuation marker at its margin;
+            // strip the markers and check the surviving content
+            let want = format!(">>> {}", "a".repeat(90));
+            let pr = (0..t.rows).rev().find(|&y| row(&t, y).starts_with(">>> ")).unwrap();
+            let got: String = (pr..=t.y).map(|y| row(&t, y)).collect::<Vec<_>>().join("").replace('\\', "");
+            write(m, b"\x04\x04".as_ptr() as *const c_void, 2);
+            pump(&mut t, 0.3);
+            close(m);
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn ipython_backspace_e2e() {
+        let ipy = "/opt/homebrew/bin/ipython";
+        if !std::path::Path::new(ipy).exists() { return }
+        let (line, x) = repl_backspace(ipy, Some("--no-banner"));
+        assert_eq!(line, "In [2]: ab");
+        assert_eq!(x, 10);
+    }
+
+    // replay a pyrepl session split at every chunk granularity through
+    // present()'s double-buffer stale logic; displayed pixels must equal a
+    // from-scratch full redraw of the same final state
+    #[test]
+    fn incremental_render_matches_full() {
+        let session: Vec<u8> = [
+            &b"\x1b[?2004h\x1b[?1h\x1b=\x1b[?25l\x1b[1A\n\x1b[1;35m>>> \x1b[0m\x1b[4D\x1b[?12l\x1b[?25h\x1b[4C"[..],
+            b"\x1b[?25l\x1b[4D\x1b[1;35m>>> \x1b[0ma\x1b[5D\x1b[?12l\x1b[?25h\x1b[5C",
+            b"\x1b[?25l\x1b[5D\x1b[1;35m>>> \x1b[0mab\x1b[6D\x1b[?12l\x1b[?25h\x1b[6C",
+            b"\x1b[?25l\x1b[6D\x1b[1;35m>>> \x1b[0mabc\x1b[7D\x1b[?12l\x1b[?25h\x1b[7C",
+            b"\x1b[?25l\x1b[7D\x1b[K\x1b[1;35m>>> \x1b[0mab\x1b[6D\x1b[?12l\x1b[?25h\x1b[6C",
+        ]
+        .concat();
+        let (cols, rows) = (100usize, 30usize);
+        for chunk in [1usize, 2, 3, 5, 7, 16, 64, session.len()] {
+            let mut atlas = Atlas::new(13.0);
+            let (w, h) = (cols * atlas.cw + 8, rows * atlas.ch + 8);
+            let mut t = Term::new(cols, rows, 100, FG, BG);
+            let mut bufs = [vec![0u32; w * h], vec![0u32; w * h]];
+            let mut stale = [vec![false; rows], vec![false; rows]];
+            let mut stale_all = [true, true];
+            let mut drawn = vec![];
+            let mut cur = 0usize;
+            let mut last_cursor = (0usize, 0usize);
+            let mut shown = 1usize;
+            for piece in session.chunks(chunk) {
+                t.feed(piece);
+                let cpos = (t.y, t.x);
+                if cpos != last_cursor {
+                    t.mark(last_cursor.0);
+                    t.mark(cpos.0);
+                    last_cursor = cpos;
+                }
+                if stale_all[cur] {
+                    t.all_dirty = true;
+                } else {
+                    for d in 0..rows {
+                        if stale[cur][d] { t.dirty[d] = true }
+                    }
+                }
+                let was_all = t.all_dirty;
+                let mut fb = Fb { px: &mut bufs[cur], w, h, stride: w, ox: 4, oy: 4 };
+                let drew = render::frame(&mut t, &mut atlas, &mut fb, &None, true, &mut drawn);
+                if !drew { continue }
+                stale[cur].fill(false);
+                stale_all[cur] = false;
+                let o = 1 - cur;
+                if was_all {
+                    stale_all[o] = true;
+                } else {
+                    for (s, &d) in stale[o].iter_mut().zip(&drawn) { *s |= d }
+                }
+                shown = cur;
+                cur = o;
+            }
+            let mut rt = Term::new(cols, rows, 100, FG, BG);
+            rt.feed(&session);
+            rt.all_dirty = true;
+            let mut rbuf = vec![0u32; w * h];
+            let mut fb = Fb { px: &mut rbuf, w, h, stride: w, ox: 4, oy: 4 };
+            render::frame(&mut rt, &mut atlas, &mut fb, &None, true, &mut drawn);
+            let diff = bufs[shown].iter().zip(&rbuf).filter(|(a, b)| a != b).count();
+            assert_eq!(diff, 0, "chunk={}: {} pixels differ from full redraw", chunk, diff);
+        }
+    }
+
+    #[test]
+    fn python_backspace_e2e() {
+        for py in ["/opt/homebrew/bin/python3", "/usr/bin/python3"] {
+            if !std::path::Path::new(py).exists() { continue }
+            let (line, x) = repl_backspace(py, None);
+            assert_eq!(line, ">>> ab", "python {}", py);
+            assert_eq!(x, 6, "python {}", py);
+        }
+    }
+
+    // user dotfiles run `stty erase ^H`; pyrepl binds backspace to VERASE, so
+    // the backspace key must send the tty's erase char, not a hardcoded 0x7f
+    #[test]
+    fn python_backspace_stty_erase_e2e() {
+        unsafe {
+            let m = posix_openpt(O_RDWR | O_NOCTTY);
+            assert!(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0);
+            let sname = CStr::from_ptr(ptsname(m)).to_owned();
+            let ws = Winsize { row: 30, col: 100, xpix: 0, ypix: 0 };
+            ioctl(m, TIOCSWINSZ, &ws);
+            let pid = fork();
+            if pid == 0 {
+                setsid();
+                let s = open(sname.as_ptr(), O_RDWR);
+                ioctl(s, TIOCSCTTY, 0u64);
+                let mut tio = Termios { iflag: 0, oflag: 0, cflag: 0, lflag: 0, cc: [0; 20], ispeed: 0, ospeed: 0 };
+                tcgetattr(s, &mut tio);
+                tio.cc[VERASE] = 0x08;
+                tcsetattr(s, 0, &tio);
+                dup2(s, 0); dup2(s, 1); dup2(s, 2);
+                let path = CString::new("/opt/homebrew/bin/python3").unwrap();
+                let q = CString::new("-q").unwrap();
+                let argv = [path.as_ptr(), q.as_ptr(), null()];
+                let term = CString::new("TERM=xterm-256color").unwrap();
+                let envp = [term.as_ptr(), null()];
+                execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                _exit(127);
+            }
+            fcntl(m, F_SETFL, O_NONBLOCK);
+            let mut t = Term::new(100, 30, 100, FG, BG);
+            let pump = |t: &mut Term, secs: f64| {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+                while std::time::Instant::now() < end {
+                    let mut buf = [0u8; 65536];
+                    let n = read(m, buf.as_mut_ptr() as *mut c_void, buf.len());
+                    if n > 0 {
+                        t.feed(&buf[..n as usize]);
+                        let out = std::mem::take(&mut t.out);
+                        if !out.is_empty() { write(m, out.as_ptr() as *const c_void, out.len()); }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            };
+            pump(&mut t, 2.0);
+            write(m, b"abc".as_ptr() as *const c_void, 3);
+            pump(&mut t, 1.0);
+            // what the backspace key now sends: the tty's VERASE, read off the master
+            let erase = erase_byte(m);
+            assert_eq!(erase, 0x08, "expected remapped VERASE visible on master");
+            write(m, [erase].as_ptr() as *const c_void, 1);
+            pump(&mut t, 1.0);
+            let r = (row(&t, t.y), t.x);
+            write(m, b"\x04".as_ptr() as *const c_void, 1);
+            pump(&mut t, 0.3);
+            close(m);
+            assert_eq!(r.0, ">>> ab");
+            assert_eq!(r.1, 6);
+        }
+    }
+
+    #[test]
+    fn pid_cwd_offsets() {
+        let cwd = pid_cwd(std::process::id() as c_int).unwrap();
+        assert_eq!(cwd, std::env::current_dir().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn icon_wrap() {
+        assert_eq!(icon_lines("trm"), ["trm"]);
+        assert_eq!(icon_lines("aaaa-bbbb-cccc"), ["aaaa-", "bbbb-", "cccc"]);
+        assert_eq!(icon_lines("claude-code"), ["claude-", "code"]);
+        assert_eq!(icon_lines("superpowers"), ["superp", "owers"]);
+        assert_eq!(icon_lines("a-b-c-d-e"), ["a-b-c-d-", "e"]);
+        assert_eq!(icon_lines("~"), ["~"]);
+    }
+
+    #[test]
+    fn tilde_abbrev() {
+        let h = std::env::var("HOME").unwrap();
+        assert_eq!(tilde(&h), "~");
+        assert_eq!(tilde(&format!("{}/work", h)), "~/work");
+        assert_eq!(tilde(&format!("{}work", h)), format!("{}work", h));
+        assert_eq!(tilde("/tmp"), "/tmp");
+    }
+}
+
+fn pty_spawn(cols: usize, rows: usize) -> (c_int, c_int) {
     unsafe {
         let m = posix_openpt(O_RDWR | O_NOCTTY);
         assert!(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0, "pty failed");
@@ -389,7 +832,7 @@ fn pty_spawn(cols: usize, rows: usize) -> c_int {
             _exit(127);
         }
         fcntl(m, F_SETFL, O_NONBLOCK);
-        m
+        (m, pid)
     }
 }
 
@@ -448,8 +891,9 @@ extern "C" fn v_drag_perform(_s: Id, _c: SEL, info: Id) -> bool {
 extern "C" fn v_key_down(this: Id, _c: SEL, ev: Id) {
     let (ch, mods) = unsafe { (ev_char(ev), msg![u64: ev, "modifierFlags"]) };
     let act = {
+        let erase = erase_char();
         let a = app();
-        input::key(ch, mods, &a.t.modes)
+        input::key(ch, mods, &a.t.modes, erase)
     };
     match act {
         Act::Write(b) => send(&b),
@@ -458,7 +902,13 @@ extern "C" fn v_key_down(this: Id, _c: SEL, ev: Id) {
         Act::Font(d) => set_font(d),
         Act::NewWindow => {
             if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).spawn();
+                let pt = format!("{}", app().font_pt);
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.arg(&pt);
+                if let Some(cwd) = fg_cwd() { cmd.current_dir(cwd); }
+                if cmd.spawn().is_err() {
+                    let _ = std::process::Command::new(exe).arg(&pt).spawn();
+                }
             }
         }
         Act::Quit => std::process::exit(0),
@@ -485,7 +935,7 @@ extern "C" fn v_do_command(_s: Id, _c: SEL, cmd: SEL) {
     match name {
         b"insertNewline:" | b"insertLineBreak:" => send(b"\r"),
         b"insertTab:" => send(b"\t"),
-        b"deleteBackward:" => send(b"\x7f"),
+        b"deleteBackward:" => send(&[erase_char()]),
         b"cancelOperation:" => send(b"\x1b"),
         _ => {}
     }
@@ -681,7 +1131,11 @@ fn main() {
         let screen: Id = msg![Id: cls("NSScreen"), "mainScreen"];
         let sf: f64 = if screen.is_null() { 2.0 } else { msg![f64: screen, "backingScaleFactor"] };
         let scale = if sf > 1.5 { 2usize } else { 1 };
-        let atlas = Atlas::new(FONT_PT * scale as f64);
+        let font_pt = std::env::args().nth(1)
+            .and_then(|a| a.parse::<f64>().ok())
+            .filter(|p| p.is_finite())
+            .map_or(FONT_PT, |p| p.max(1.0));
+        let atlas = Atlas::new(font_pt * scale as f64);
 
         let pad = (atlas.cw / 3).max(2);
         let w = (COLS * atlas.cw + 2 * pad) as f64 / scale as f64;
@@ -706,22 +1160,22 @@ fn main() {
         let _: () = msg![(): layer, "setContentsScale:", f64: scale as f64];
 
         let t = Term::new(COLS, ROWS, SCROLLBACK, FG, BG);
-        let pty = pty_spawn(COLS, ROWS);
+        let (pty, child) = pty_spawn(COLS, ROWS);
         G = Box::into_raw(Box::new(App {
             t, atlas,
             surf: [null_mut(); 2], cur: 0,
             stale: [vec![], vec![]], stale_all: [true; 2], drawn: vec![],
             fbw: 0, fbh: 0,
             win, layer, view,
-            scale, font_pt: FONT_PT,
-            pty, fdref: null_mut(),
+            scale, font_pt,
+            pty, child, fdref: null_mut(),
             outq: VecDeque::new(),
             frame_scheduled: false, sync_since: 0.0,
             sel: input::Sel::default(),
             last_cursor: (0, 0),
             scroll_acc: 0.0, focused: true, ready: false,
             view_w: w, view_h: h,
-            title: "trm".into(),
+            cwd: String::new(),
         }));
 
         let fdref = CFFileDescriptorCreate(null(), pty, false, pty_cb, null_mut());
@@ -730,6 +1184,10 @@ fn main() {
         CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopCommonModes);
         CFRelease(src);
         CFFileDescriptorEnableCallBacks(fdref, FD_READ_CB);
+
+        let cwt = CFRunLoopTimerCreate(null(), CFAbsoluteTimeGetCurrent(), 0.5, 0, 0, cwd_cb, null_mut());
+        CFRunLoopAddTimer(CFRunLoopGetMain(), cwt, kCFRunLoopCommonModes);
+        CFRelease(cwt);
 
         app().ready = true;
         relayout();

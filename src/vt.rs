@@ -994,6 +994,28 @@ mod tests {
     }
 
     #[test]
+    fn pyrepl_backspace() {
+        // byte-for-byte echo of python 3.13's pyrepl: startup, type "abc", press backspace once
+        let session: &[&[u8]] = &[
+            b"\x1b[?2004h\x1b[?1h\x1b=\x1b[?25l\x1b[1A\n\x1b[1;35m>>> \x1b[0m\x1b[4D\x1b[?12l\x1b[?25h\x1b[4C",
+            b"\x1b[?25l\x1b[4D\x1b[1;35m>>> \x1b[0ma\x1b[5D\x1b[?12l\x1b[?25h\x1b[5C",
+            b"\x1b[?25l\x1b[5D\x1b[1;35m>>> \x1b[0mab\x1b[6D\x1b[?12l\x1b[?25h\x1b[6C",
+            b"\x1b[?25l\x1b[6D\x1b[1;35m>>> \x1b[0mabc\x1b[7D\x1b[?12l\x1b[?25h\x1b[7C",
+            b"\x1b[?25l\x1b[7D\x1b[K\x1b[1;35m>>> \x1b[0mab\x1b[6D\x1b[?12l\x1b[?25h\x1b[6C",
+        ];
+        let mut whole = Term::new(100, 30, 100, 0xffffff, 0);
+        let mut split = Term::new(100, 30, 100, 0xffffff, 0);
+        for chunk in session {
+            whole.feed(chunk);
+            for b in chunk.iter() { split.feed(&[*b]) }
+        }
+        for t in [&whole, &split] {
+            assert_eq!(dump(t).lines().nth(1).unwrap(), ">>> ab");
+            assert_eq!((t.y, t.x), (1, 6));
+        }
+    }
+
+    #[test]
     fn responses() {
         for (input, want) in [
             ("\x1b[c", "\x1b[?6c"),
